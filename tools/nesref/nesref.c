@@ -1,4 +1,4 @@
-/* nesref.c - host-only reference NES (6502 + MMC1 + PPU) used to study the original game and to check the
+/* nesref.c - host-only reference NES (6502 + MMC1 or AxROM + PPU, NTSC or PAL timing) used to study the original game and to check the
  * port against it. It never runs on the Amiga.
  *
  *   nesref rom.nes FRAMES [options]
@@ -8,6 +8,8 @@
  *     -c cov.txt        write code coverage: "bank pc" of every executed instruction + indirect targets
  *     -s                print per-frame stats (instructions, ppu writes)
  *     -t                trace every instruction (huge)
+ *     -P / -N           force PAL / NTSC timing (default: from the NES 2.0 header, else NTSC)
+ *   Banks in -c output: 16 KB bank numbers for MMC1 (fixed bank = last), 32 KB bank numbers for AxROM (mapper 7).
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,6 +21,9 @@ static uint8_t ram[0x800], vram[0x800], pal[32], oam[256], chrram[0x2000];
 /* MMC1 */
 static uint8_t m_shift = 0x10, m_ctrl = 0x0c, m_chr0, m_chr1, m_prg;
 static uint8_t prgram[0x2000];
+/* AxROM (mapper 7): 32 KB PRG bank, one-screen mirroring */
+static int mapper = 1, pal_timing; static uint8_t ax_reg;
+static int BANKSZ = 0x4000;   /* bytes per bank number in the -c output */
 
 /* CPU */
 static uint8_t A, X, Y, S = 0xfd, P = 0x24; static uint16_t PC;
@@ -50,6 +55,7 @@ static void flow(char kind, uint16_t from, uint16_t to)
 
 static int prg_bank_for(uint16_t a)
 {
+    if (mapper == 7) return ax_reg & 7 & (prg_banks / 2 - 1);
     int mode = (m_ctrl >> 2) & 3, b = m_prg & 0x0f;
     if (mode < 2) return (a < 0xc000) ? (b & 0xe) : (b | 1);
     if (mode == 2) return (a < 0xc000) ? 0 : b;
@@ -67,6 +73,7 @@ static uint8_t *chr_ptr(uint16_t a)
 static uint16_t nt_addr(uint16_t a)
 {
     a &= 0xfff;
+    if (mapper == 7) return ((ax_reg & 0x10) ? 0x400 : 0) | (a & 0x3ff);
     switch (m_ctrl & 3) {
     case 0: return a & 0x3ff;
     case 1: return 0x400 | (a & 0x3ff);
@@ -106,7 +113,7 @@ static uint8_t rd(uint16_t a)
     if (a == 0x4017) return 0x40;
     if (a < 0x6000) return 0;
     if (a < 0x8000) return prgram[a & 0x1fff];
-    return prg[prg_bank_for(a) * 0x4000 + (a & 0x3fff)];
+    return prg[prg_bank_for(a) * BANKSZ + (a & (BANKSZ - 1))];
 }
 static void wr(uint16_t a, uint8_t d)
 {
@@ -121,7 +128,7 @@ static void wr(uint16_t a, uint8_t d)
         case 4: oam[oamaddr++] = d; break;
         case 5: if (!w) { t = (t & 0xffe0) | (d >> 3); fx = d & 7; } else t = (t & 0x8c1f) | ((d & 7) << 12) | ((d & 0xf8) << 2); w ^= 1; break;
         case 6: if (!w) t = (t & 0x00ff) | ((d & 0x3f) << 8); else { t = (t & 0xff00) | d; v = t; } w ^= 1; break;
-        case 7: ppu_write(v, d); v += (ppuctrl & 4) ? 32 : 1; break;
+        case 7: if (trace) printf("  VRAM %04x <- %02x\n", v & 0x3fff, d); ppu_write(v, d); v += (ppuctrl & 4) ? 32 : 1; break;
         }
         return;
     }
@@ -129,6 +136,7 @@ static void wr(uint16_t a, uint8_t d)
     if (a == 0x4016) { strobe = d & 1; if (strobe) padshift = pad; return; }
     if (a < 0x6000) return;
     if (a < 0x8000) { prgram[a & 0x1fff] = d; return; }
+    if (mapper == 7) { if (trace) printf("  MAP %04x <- %02x\n", a, d); ax_reg = d; return; }
     /* MMC1 */
     if (d & 0x80) { m_shift = 0x10; m_ctrl |= 0x0c; return; }
     { int done = m_shift & 1; m_shift = (m_shift >> 1) | ((d & 1) << 4);
@@ -143,7 +151,7 @@ static void cov_mark(uint16_t pc, int kind)
     long idx;
     if (!cov) return;
     if (pc < 0x8000) { idx = 0; if (!(cov[prg_banks * 0x4000 + (pc & 0x7ff)] & 1)) fprintf(covf, "R %04x\n", pc); cov[prg_banks * 0x4000 + (pc & 0x7ff)] |= 1; return; }
-    idx = bank * 0x4000 + (pc & 0x3fff);
+    idx = bank * BANKSZ + (pc & (BANKSZ - 1));
     if (!(cov[idx] & kind)) { cov[idx] |= kind; if (kind != 1) fprintf(covf, "%c %d %04x\n", kind == 2 ? 'J' : kind == 4 ? 'S' : 'N', bank, pc); }
     (void)idx;
 }
@@ -183,6 +191,9 @@ static void step(void)
     uint8_t op, m, lo, hi; uint16_t a = 0, pc0 = PC; int mode;
     if (nmi_pending == 1) { nmi_pending = 0; irq_nmi(0xfffa); pc0 = PC; } else if (nmi_pending) nmi_pending--;   /* NMI one instruction after the flag rises */
     if (cov) cov_mark(PC, 1);
+    { static int lastbank = -1; int nb = PC >= 0x8000 ? prg_bank_for(PC) : -1;
+      if (nb >= 0 && lastbank >= 0 && nb != lastbank) flow('B', pc0, PC);
+      if (nb >= 0) lastbank = nb; }
     if (prof) prof[(PC >= 0x8000 ? prg_bank_for(PC) : 15) * 0x10000 + PC]++;
     op = rd(PC++);
     if (trace) printf("%02x:%04x %02x A=%02x X=%02x Y=%02x P=%02x S=%02x\n", pc0 >= 0x8000 ? prg_bank_for(pc0) : 0xff, pc0, op, A, X, Y, P, S);
@@ -339,7 +350,11 @@ static void dump(const char *dir, int f)
     fclose(o);
 }
 
-static void run_cycles(long long n) { long long end = cycles + n; while (cycles < end) step(); }
+static void run_cycles(long long n) { static long long end; if (end < cycles - 1000 || end > cycles + 100000) end = cycles; end += n; while (cycles < end) step(); }
+/* cycles per scanline: NTSC 113.67 (85 + 29, 20 vblank lines), PAL 106.56 (80 + 27, 70 vblank lines) */
+#define LINE_A (pal_timing ? 80 : 85)
+#define LINE_B (pal_timing ? 26 : 29)
+#define VBL_CYC (pal_timing ? 7460 : 114 * 20)
 
 typedef struct { int a, b; uint8_t bits; } In;
 static In ins[4096]; static int nin;
@@ -357,6 +372,10 @@ int main(int argc, char **argv)
     f = fopen(argv[1], "rb"); if (!f) return 2; fseek(f, 0, SEEK_END); sz = ftell(f); rewind(f);
     rom = malloc(sz); if (fread(rom, 1, sz, f) != (size_t)sz) return 2; fclose(f);
     prg_banks = rom[4]; chr_banks8 = rom[5]; prg = rom + 16; chr = prg + prg_banks * 0x4000;
+    mapper = (rom[6] >> 4) | (rom[7] & 0xf0);
+    if (mapper == 7) BANKSZ = 0x8000;
+    else if (mapper != 1) { fprintf(stderr, "nesref: mapper %d not supported\n", mapper); return 2; }
+    if ((rom[7] & 0x0c) == 0x08 && (rom[12] & 3) == 1) pal_timing = 1;    /* NES 2.0: PAL */
     frames = atoi(argv[2]);
     for (i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "-i")) { FILE *g = fopen(argv[++i], "r"); char l[256]; while (g && fgets(l, sizeof l, g)) { char *p, *tok; In in; if (sscanf(l, "%d %d", &in.a, &in.b) != 2) continue; in.bits = 0; p = l; strtol(p, &p, 10); strtol(p, &p, 10); for (tok = strtok(p, " \t\r\n+"); tok; tok = strtok(0, " \t\r\n+")) in.bits |= btn(tok); ins[nin++] = in; } if (g) fclose(g); }
@@ -366,6 +385,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "-s")) stats = 1;
         else if (!strcmp(argv[i], "-p")) { proff = fopen(argv[++i], "w"); prof = calloc(16 * 0x10000, sizeof *prof); }
         else if (!strcmp(argv[i], "-t")) trace = 1;
+        else if (!strcmp(argv[i], "-P")) pal_timing = 1;
+        else if (!strcmp(argv[i], "-N")) pal_timing = 0;
     }
     PC = rd(0xfffc) | (rd(0xfffd) << 8);
     if (cov) cov_mark(PC, 4);
@@ -373,30 +394,34 @@ int main(int argc, char **argv)
         int y; char key[16];
         pad = 0; for (i = 0; i < nin; i++) if (fr >= ins[i].a && fr <= ins[i].b) pad |= ins[i].bits;
         frame_instr = frame_ppuw = frame_2002r = 0;
+        { static int tf = -2; if (tf == -2) { char *e = getenv("TRACE_FROM"); tf = e ? atoi(e) : -1; } if (tf >= 0 && fr == tf) trace = 1; }   /* TRACE_FROM=frame */
         if (trace) printf("---- frame %d\n", fr);
         /* pre-render line: copy vertical bits */
         ppustatus &= ~0x60;
         for (y = 0; y < 240; y++) {
             scanline = y;
-            run_cycles(85);
+            run_cycles(LINE_A);
             if (ppumask & 0x18) { if (y == 0) v = t; render_line(y);
                 /* increment y */
                 if ((v & 0x7000) != 0x7000) v += 0x1000; else { int cy; v &= ~0x7000; cy = (v & 0x03e0) >> 5;
                     if (cy == 29) { cy = 0; v ^= 0x0800; } else if (cy == 31) cy = 0; else cy++; v = (v & ~0x03e0) | (cy << 5); }
                 v = (v & ~0x041f) | (t & 0x041f); }
             else memset(fb[y], pal[0], 256);
-            run_cycles(29);
+            run_cycles(LINE_B);
         }
-        scanline = 240; run_cycles(114);
+        scanline = 240; run_cycles(LINE_A + LINE_B);
         ppustatus |= 0x80; if (ppuctrl & 0x80) nmi_pending = 2;
-        scanline = 241; run_cycles(114 * 20);
+        scanline = 241; run_cycles(VBL_CYC);
         ppustatus &= 0x1f;
-        scanline = -1; run_cycles(114);
-        if (stats) printf("frame %d instr %ld ppuw %ld r2002 %ld ctrl %02x mask %02x mmc %02x/%02x/%02x/%02x\n", fr, frame_instr, frame_ppuw, frame_2002r, ppuctrl, ppumask, m_ctrl, m_chr0, m_chr1, m_prg);
+        scanline = -1; run_cycles(LINE_A + LINE_B);
+        if (stats) printf("frame %d instr %ld ppuw %ld r2002 %ld ctrl %02x mask %02x mmc %02x/%02x/%02x/%02x\n", fr, frame_instr, frame_ppuw, frame_2002r, ppuctrl, ppumask, mapper == 7 ? ax_reg : m_ctrl, m_chr0, m_chr1, m_prg);
         snprintf(key, sizeof key, ",%d,", fr);
         if (strstr(dumps, key)) dump(dir, fr);
     }
-    if (covf) { for (i = 0; i < prg_banks * 0x4000; i++) if (cov[i] & 1) fprintf(covf, "E %d %04x\n", i / 0x4000, (i / 0x4000 == prg_banks - 1 ? 0xc000 : 0x8000) + (i & 0x3fff)); fclose(covf); }
+    if (covf) { for (i = 0; i < prg_banks * 0x4000; i++) if (cov[i] & 1) {
+        if (mapper == 7) fprintf(covf, "E %d %04x\n", i / 0x8000, 0x8000 + (i & 0x7fff));
+        else fprintf(covf, "E %d %04x\n", i / 0x4000, (i / 0x4000 == prg_banks - 1 ? 0xc000 : 0x8000) + (i & 0x3fff)); }
+        fclose(covf); }
     if (proff) { for (i = 0; i < 16 * 0x10000; i++) if (prof[i]) fprintf(proff, "%u %x %04x\n", prof[i], i >> 16, i & 0xffff); fclose(proff); }
     fprintf(stderr, "instructions %lld\n", instr_total);
     return 0;
