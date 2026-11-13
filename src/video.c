@@ -49,7 +49,7 @@
 #endif
 
 #ifdef LOGIC_TRACE
-ULONG vprof[4], vtiles;                 /* debug: colour clocks in cell redraws, streaming, sprites; tiles drawn */
+ULONG vprof[8], vtiles;                 /* debug: colour clocks in cell redraws, streaming, sprites; tiles drawn */
 extern uint32_t logic_frames;
 #define VP(i, x) do { ULONG t0_ = sys_now(); x; if (logic_frames >= 2000 && logic_frames < 2500) vprof[i] += sys_now() - t0_; } while (0)
 #else
@@ -254,51 +254,97 @@ static UBYTE bar_tused[256];            /* tiles the bar bitmap shows */
 static int bar_valid, bar_drawn_h;
 static LONG bar_x = -1; static int bar_y = -1, bar_h;
 
-/* the bar bitmap from the bar page: 2 border words each side, colour 0 drawn as colour 4 */
+/* one cell of the bar page into the bar bitmap (2 border words each side, colour 0 drawn as colour 4) */
+static void bar_cell(int r, int c)
+{
+    int k, top = pf_h;
+    UWORD cell = (UWORD)(bar_page | (r << 5) | c);
+    UBYTE attr = nes_vram[bar_page | 0x3c0 | ((r >> 2) << 3) | (c >> 2)];
+    UBYTE pal = (UBYTE)((attr >> (((r & 2) << 1) | (c & 2))) & 3);
+    const UBYTE *chr = bg_chr(nes_vram[cell]);
+    UBYTE *b;
+    bar_tused[nes_vram[cell]] = 1;
+    for (k = 0; k < 8; k++) {
+        int line = BAR_V_LINE + r * 8 + k - top;          /* bitmap line of NES line BAR_V_LINE + 8r + k */
+        UBYTE p0 = chr[k], p1 = chr[k + 8], m = (UBYTE)(p0 | p1);
+        if (line + top < BAR_SHOW || line < 0 || line >= BAR_LINES) continue;
+        b = bar_bm + line * BAR_ROWB + 4 + c;
+        b[0] = p0; b[BAR_PLANE] = p1;
+        b[2 * BAR_PLANE] = (pal & 1) ? 0xff : (UBYTE)~m;
+        b[3 * BAR_PLANE] = (pal & 2) ? m : 0;
+    }
+}
+
 static void render_bar(void)
 {
-    int r, c, k, p, top = pf_h;
-    UBYTE *b;
+    int r, c, p;
     for (p = 0; p < 4; p++) memset(bar_bm + p * BAR_PLANE, p == 2 ? 0xff : 0, BAR_PLANE);
     memset(bar_tused, 0, sizeof bar_tused);
-    for (r = 0; r < 8; r++)
-        for (c = 0; c < 32; c++) {
-            UWORD cell = (UWORD)(bar_page | (r << 5) | c);
-            UBYTE attr = nes_vram[bar_page | 0x3c0 | ((r >> 2) << 3) | (c >> 2)];
-            UBYTE pal = (UBYTE)((attr >> (((r & 2) << 1) | (c & 2))) & 3);
-            const UBYTE *chr = bg_chr(nes_vram[cell]);
-            bar_tused[nes_vram[cell]] = 1;
-            for (k = 0; k < 8; k++) {
-                int line = BAR_V_LINE + r * 8 + k - top;          /* bitmap line of NES line BAR_V_LINE + 8r + k */
-                UBYTE p0 = chr[k], p1 = chr[k + 8], m = (UBYTE)(p0 | p1);
-                if (line + top < BAR_SHOW || line < 0 || line >= BAR_LINES) continue;
-                b = bar_bm + line * BAR_ROWB + 4 + c;
-                b[0] = p0; b[BAR_PLANE] = p1;
-                b[2 * BAR_PLANE] = (pal & 1) ? 0xff : (UBYTE)~m;   /* colour 0 -> colour 4 */
-                b[3 * BAR_PLANE] = (pal & 2) ? m : 0;
-            }
-        }
-    bar_drawn_h = 240 - top;
+    for (r = 0; r < 8; r++) for (c = 0; c < 32; c++) bar_cell(r, c);
+    bar_drawn_h = 240 - pf_h;
+}
+
+/* the game changed bar page cell i (or an attribute cell): redraw those cells of the bitmap */
+static void bar_update_cell(UWORD i)
+{
+    int r, c;
+    i &= 0x3ff;
+    if (i < 0x100) { bar_cell(i >> 5, i & 31); return; }
+    if (i >= 0x3c0 && i < 0x3c8) {                      /* attribute rows 0-1 cover tile rows 0-7 */
+        int ax = (i & 7) * 4, ay = ((i - 0x3c0) >> 3) * 4;
+        for (r = ay; r < ay + 4 && r < 8; r++) for (c = ax; c < ax + 4; c++) bar_cell(r, c);
+    } else if (i >= 0x3c8 && i < 0x3d0) {
+        int ax = (i & 7) * 4;
+        for (r = 4; r < 8; r++) for (c = ax; c < ax + 4; c++) bar_cell(r, c);
+    }
+}
+
+static void bar_update_tile(UBYTE t)
+{
+    int i;
+    if (!bar_tused[t]) return;
+    for (i = 0; i < 256; i++) if (nes_vram[bar_page | i] == t) bar_cell(i >> 5, i & 31);
 }
 
 #ifdef __m68k__
-static void blit_bar(LONG wx, int wy, int lines)
+/* The four plane blits are queued: the CPU starts the next one when the blitter is free (bar_pump(), called
+   while the sprites are built in fast RAM) instead of waiting for each. */
+static int bar_next = 4;
+static ULONG bar_off; static UWORD bar_sh, bar_lines;
+static void bar_start(int p)
 {
     volatile struct Custom *cu = (volatile struct Custom *)0xdff000;
-    ULONG bx = (ULONG)(wx - 32 + disp_margin), off = (ULONG)wy * 64 + ((bx >> 3) & ~1UL);
-    UWORD sh = (UWORD)(bx & 15);
-    int p;
-    for (p = 0; p < 4; p++) {
-        blit_wait();
-        cu->bltcon0 = (UWORD)(0x09f0 | (sh << 12));
-        cu->bltcon1 = 0;
-        cu->bltafwm = 0xffff; cu->bltalwm = 0xffff;
-        cu->bltapt = bar_bm + p * BAR_PLANE;
-        cu->bltdpt = disp_front + p * disp_plane + off;
-        cu->bltamod = BAR_ROWB - 2 * BAR_WORDS;
-        cu->bltdmod = 64 - 2 * BAR_WORDS;
-        cu->bltsize = (UWORD)((lines << 6) | BAR_WORDS);
-    }
+    cu->bltcon0 = (UWORD)(0x09f0 | (bar_sh << 12));
+    cu->bltcon1 = 0;
+    cu->bltafwm = 0xffff; cu->bltalwm = 0xffff;
+    cu->bltapt = bar_bm + p * BAR_PLANE;
+    cu->bltdpt = disp_front + p * disp_plane + bar_off;
+    cu->bltamod = BAR_ROWB - 2 * BAR_WORDS;
+    cu->bltdmod = 64 - 2 * BAR_WORDS;
+    cu->bltsize = (UWORD)((bar_lines << 6) | BAR_WORDS);
+}
+static void bar_pump(void)
+{
+    volatile struct Custom *cu = (volatile struct Custom *)0xdff000;
+    if (bar_next >= 4) return;
+    (void)cu->dmaconr;
+    if (cu->dmaconr & 0x4000) return;               /* blitter busy */
+    bar_start(bar_next++);
+}
+static void bar_finish(void)
+{
+    while (bar_next < 4) { blit_wait(); bar_start(bar_next++); }
+}
+static void blit_bar(LONG wx, int wy, int lines)
+{
+    ULONG bx = (ULONG)(wx - 32 + disp_margin);
+    bar_finish();
+    blit_wait();
+    bar_off = (ULONG)wy * 64 + ((bx >> 3) & ~1UL);
+    bar_sh = (UWORD)(bx & 15);
+    bar_lines = (UWORD)lines;
+    bar_start(0);
+    bar_next = 1;
 }
 #else                                   /* the same copy in C, for the host harness tools/vhost.c */
 static void blit_bar(LONG wx, int wy, int lines)
@@ -314,13 +360,15 @@ static void blit_bar(LONG wx, int wy, int lines)
                 d[dx >> 3] = (UBYTE)((d[dx >> 3] & ~(0x80 >> (dx & 7))) | (bit << (7 - (dx & 7))));
             }
 }
+static void bar_pump(void) { }
+static void bar_finish(void) { }
 #endif
 
 static void bar_frame(int sy, int moved)
 {
     int r, y0 = sy + pf_h, y1 = sy + 240;
+    if (!bar_valid || bar_drawn_h != 240 - pf_h) { render_bar(); bar_valid = 1; moved = 1; }
     if (!moved && bar_x == cam_ux && bar_y == sy && bar_h == pf_h) return;
-    if (!bar_valid || bar_drawn_h != 240 - pf_h) { render_bar(); bar_valid = 1; }
     blit_bar(cam_ux, y0, y1 - y0);
     bar_x = cam_ux; bar_y = sy; bar_h = pf_h;
     for (r = 0; r < 30; r++) {                          /* the row copies the bar covered must be drawn again */
@@ -345,6 +393,7 @@ static int hn[7];
 static UBYTE *spr_mem[2][7];            /* two sets of sprite lists, swapped every frame */
 static int spr_set;
 int video_sprites_dropped;
+ULONG vstat[4];                         /* host statistics: groups, cache hits, NES sprites drawn, merges */
 static int spr_split;                   /* under a split, sprite 0 only marks it and the bar shows from BAR_SHOW */
 
 static void build_groups(void)
@@ -378,15 +427,24 @@ static void build_groups(void)
         for (j = i + 1; j < ngrp && j <= i + 6; j++) {
             Group *a = &grp[i], *b = &grp[j];
             WORD nx0 = a->x0 < b->x0 ? a->x0 : b->x0, nx1 = a->x1 > b->x1 ? a->x1 : b->x1;
-            if (nx1 - nx0 > SPR_W || a->n + b->n > MAXIN) continue;
+            if (!a->n || !b->n || nx1 - nx0 > SPR_W || a->n + b->n > MAXIN) continue;
             if (b->y0 > a->y1 + 1 || b->y1 < a->y0 - 1 || b->x0 > a->x1 + 1 || b->x1 < a->x0 - 1) continue;
             a->x0 = nx0; a->x1 = nx1;
             if (b->y0 < a->y0) a->y0 = b->y0;
             if (b->y1 > a->y1) a->y1 = b->y1;
             for (k = 0; k < b->n; k++) a->idx[a->n++] = b->idx[k];
             a->pals |= b->pals;
-            grp[j] = grp[--ngrp]; j--;
+            b->n = 0;                                   /* merged away: skipped from here on */
+            b->y0 = 0x7fff;
         }
+    for (i = j = 0; i < ngrp; i++)                      /* drop the merged-away groups (only the used part moves) */
+        if (grp[i].n) {
+            if (i != j) { Group *a = &grp[j], *b = &grp[i];
+                a->x0 = b->x0; a->x1 = b->x1; a->y0 = b->y0; a->y1 = b->y1; a->n = b->n; a->pals = b->pals;
+                for (k = 0; k < b->n; k++) a->idx[k] = b->idx[k]; }
+            j++;
+        }
+    ngrp = j;
 }
 
 static int fits(int n, Group *g)
@@ -511,6 +569,7 @@ static void build_sprites(void)
         ULONG sig;
         Cached *cp = cache[spr_set ^ 1], *hit = 0;
         int j;
+        bar_pump();
         if (g->se < 0) continue;
         n = (g->y1 - g->y0) * 16;
         e = spr_mem[spr_set][g->se] + g->oe;
@@ -520,13 +579,15 @@ static void build_sprites(void)
         sig = group_sig(g, o != 0);
         if (!group_changed(g))
             for (j = 0; j < ncache[spr_set ^ 1]; j++) if (cp[j].sig == sig && cp[j].n == n) { hit = &cp[j]; break; }
+        vstat[0]++;
         if (hit) {
+            vstat[1]++;
             copy_lines(e + 16, hit->e, n);
             if (o) copy_lines(o + 16, hit->o, n);
         } else {
             clear_lines(scr_e, n);
             if (o) clear_lines(scr_o, n);
-            render_group(g, scr_e, o ? scr_o : 0);
+            render_group(g, scr_e, o ? scr_o : 0); vstat[2] += g->n;
             copy_lines(e + 16, scr_e, n);           /* chip RAM is only written, once, a long at a time */
             if (o) copy_lines(o + 16, scr_o, n);
         }
@@ -584,6 +645,8 @@ void video_frame(void)
     int sy = ((((t >> 5) & 0x1f) * 8) + ((t >> 12) & 7)) % 240;
     LONG vlo, vhi;
 
+    bar_finish();                                       /* the buffer is drawn into below: no blit may still run */
+    blit_wait();
     pf_h = split ? (split_line + 2 > 240 ? 240 : split_line + 2) : 240;
     spr_split = split;
     mask_left = mask;
@@ -609,16 +672,16 @@ void video_frame(void)
     }
 
     /* CHR RAM tiles the game rewrote */
-    for (i = 0; i < chr_ndirty; i++) {
+    VP(4, for (i = 0; i < chr_ndirty; i++) {
         UWORD tl = chr_dirty[i];
         chr_dirty_flag[tl] = 0;
         if ((tl >> 8) == bgsel) {
-            if (bar_tused[tl & 255]) bar_dirty = 1;
+            if (bar_valid && bar_tused[tl & 255]) { bar_update_tile((UBYTE)tl); bar_dirty = 1; }
             if (chr_ndirty > 12) { if (col_lo <= col_hi) invalidate(); }   /* a new tile set: draw everything again */
             else if (col_lo <= col_hi) redraw_tile((UBYTE)tl);
         }
         if ((tl >> 8) == ((ppu_ctrl >> 3) & 1)) { spr_chr_dirty = 1; spr_tchg[tl & 255] = 1; }
-    }
+    });
     chr_ndirty = 0;
 
     VP(1, sync_rows(sy));
@@ -630,18 +693,17 @@ void video_frame(void)
         nes_dirty_flag[c] = 0;
         if (nes_ndirty > 200) continue;
         if ((c & 0x400) == pf_page && col_lo <= col_hi) VP(0, redraw_cell(c));
-        if (split && (c & 0x400) == bar_page && ((c & 0x3ff) < 0x100 || (c & 0x3ff) >= 0x3c0)) bar_dirty = 1;
+        if (split && bar_valid && (c & 0x400) == bar_page && ((c & 0x3ff) < 0x100 || (c & 0x3ff) >= 0x3c0)) { bar_update_cell(c); bar_dirty = 1; }
     }
     nes_ndirty = 0;
-    if (bar_dirty) bar_valid = 0;
 
     /* while the visible part is incomplete (a new screen), show black and draw quickly */
     want_cols(&vlo, &vhi);
     budget = (on && col_lo <= vlo && col_hi >= vhi) ? 24 : 120;
     VP(1, stream_cols(budget));
     if (!(col_lo <= vlo && col_hi >= vhi)) on = 0;
-    if (col_lo <= col_hi) fix_edges();
-    if (split && on) bar_frame(sy, !bar_valid);
+    VP(6, if (col_lo <= col_hi) fix_edges());
+    if (split && on) VP(5, bar_frame(sy, bar_dirty));
     else bar_x = -1;
 
     if (nes_pal_dirty || on != was_on || pal0 != last_pal0) { set_palette(on, pal0); nes_pal_dirty = 0; was_on = (UBYTE)on; last_pal0 = pal0; }
@@ -657,4 +719,5 @@ void video_frame(void)
         if (spr_chr_dirty) memset(spr_tchg, 0, sizeof spr_tchg);
     }
     else { for (i = 0; i < 7; i++) disp_sprite_off((UWORD)i); spr_valid = 0; }
+    bar_finish();
 }

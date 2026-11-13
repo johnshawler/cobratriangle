@@ -32,6 +32,7 @@ void disp_sprite(UWORD n, UWORD *d, WORD x, WORD y, UWORD h, UWORD a)
         UBYTE *b = (UBYTE *)d; b[0] = p >> 8; b[1] = (UBYTE)p; b[8] = c >> 8; b[9] = (UBYTE)c; }   /* big-endian, as on the Amiga */
 }
 void disp_sprite_off(UWORD n) { spr[n] = 0; }
+void blit_wait(void) { }
 
 static void shot(const char *name)
 {
@@ -94,6 +95,7 @@ int main(int argc, char **argv)
         snprintf(key, sizeof key, ",%u,", t + 1);
         if (strstr(list, key)) { snprintf(name, sizeof name, "vhost_%05u.ppm", t + 1); shot(name); }
     }
+    { extern ULONG vstat[4]; printf("groups %lu cache hits %lu NES sprites drawn %lu (all frames)\n", vstat[0], vstat[1], vstat[2]); }
     printf("sprite clusters dropped: %d\n", video_sprites_dropped);
     return 0;
 }

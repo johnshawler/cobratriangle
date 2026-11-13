@@ -21,7 +21,8 @@ def nm(args):
         if len(p) == 3 and p[1] in 'tT': syms.append((int(p[0], 16), p[2]))
     return sorted(syms)
 gen = nm('vasmm68k_mot -quiet -Fhunk -m68020 -I. -Isrc -o /tmp/g.o src/gen68k.s && m68k-amigaos-nm /tmp/g.o')
-cs = nm('m68k-amigaos-nm ' + exe)
+gnames = set(n for a, n in gen)
+cs = [(a, n) for a, n in nm('m68k-amigaos-nm ' + exe) if n not in gnames and not n.startswith('F') and not n.startswith('D_')]
 goff = dict((n, a) for a, n in gen)
 gbase = base - goff.get('F0_' + '%04x' % 0, goff[min(goff, key=lambda k: goff[k])]) if False else None
 ref = [n for a, n in gen if n.startswith('F')]

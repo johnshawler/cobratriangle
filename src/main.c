@@ -148,10 +148,10 @@ int main(int argc, char **argv)
             if (fh) { Write(fh, logic_trace, logic_ntrace * 4); Close(fh); }
             {   extern uint8_t logic_dump[]; fh = Open((CONST_STRPTR)"dump.bin", MODE_NEWFILE);
                 if (fh) { Write(fh, logic_dump, 0x808); Close(fh); } }
-            {   extern uint32_t video_time_sum, video_time_max, video_calls; char b[200];
+            {   extern uint32_t video_time_sum, video_time_max, video_calls; char b[300];
                 extern ULONG vprof[], vtiles;
-                sprintf(b, "video avg %lu max %lu calls %lu cells %lu stream %lu sprites %lu (grouping %lu) tiles %lu\n", (unsigned long)(video_calls ? video_time_sum / video_calls : 0), (unsigned long)video_time_max, (unsigned long)video_calls,
-                        (unsigned long)vprof[0], (unsigned long)vprof[1], (unsigned long)vprof[2], (unsigned long)vprof[3], (unsigned long)vtiles);
+                sprintf(b, "video avg %lu max %lu calls %lu cells %lu stream %lu sprites %lu (grouping %lu) tiles %lu chr %lu bar %lu edges %lu\n", (unsigned long)(video_calls ? video_time_sum / video_calls : 0), (unsigned long)video_time_max, (unsigned long)video_calls,
+                        (unsigned long)vprof[0], (unsigned long)vprof[1], (unsigned long)vprof[2], (unsigned long)vprof[3], (unsigned long)vtiles, (unsigned long)vprof[4], (unsigned long)vprof[5], (unsigned long)vprof[6]);
                 fh = Open((CONST_STRPTR)"video.txt", MODE_NEWFILE); if (fh) { Write(fh, b, strlen(b)); Close(fh); } }
             {   extern void *reset_fn; extern ULONG prof_buf[], prof_cnt; ULONG base = (ULONG)reset_fn; fh = Open((CONST_STRPTR)"prof.bin", MODE_NEWFILE);
                 ULONG cbase = (ULONG)game_tick; if (fh) { Write(fh, &base, 4); Write(fh, &cbase, 4); Write(fh, prof_buf, prof_cnt * 4); Close(fh); } }
