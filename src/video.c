@@ -278,15 +278,18 @@ static void redraw_cell(UWORD i)
     }
 }
 
+ULONG vstat_cells, vstat_draws;         /* host statistics */
 static void flush_cells(void)
 {
     int k;
     LONG uc;
+    vstat_cells = (ULONG)npend;
     for (k = 0; k < npend; k++) {
         int row = pend_list[k] >> 5, cx = pend_list[k] & 31;
         pend[row][cx] = 0;
         if (col_lo > col_hi) continue;
-        for (uc = col_lo + ((cx - col_lo) & 31); uc <= col_hi; uc += 32) draw_tile(uc, row);
+        for (uc = col_lo + ((cx - col_lo) & 31); uc <= col_hi; uc += 32)
+            if (colstate[uc & 63] != 2) { draw_tile(uc, row); vstat_draws++; }   /* border columns stay blank */
         if (work_row > row && (work_col & 31) == cx) draw_tile(work_col, row);
     }
     npend = 0;

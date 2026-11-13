@@ -93,7 +93,9 @@ int main(int argc, char **argv)
     for (t = 0; t < n; t++) {
         game_tick(game_bench_input(t));
         if (getenv("EVERY") && t % atoi(getenv("EVERY")) && !strstr(list, key0(t + 1))) continue;   /* draw only every Nth tick, like a slow Amiga */
-        vhost_frame = (int)t + 1; video_frame();
+        vhost_frame = (int)t + 1;
+        { extern ULONG vstat_cells, vstat_draws; extern uint16_t nes_ndirty; unsigned nd = nes_ndirty; vstat_draws = 0; video_frame();
+          if (getenv("CELLSTAT") && t >= 1500) printf("cells t=%u dirty %u marked %lu draws %lu\n", t, nd, vstat_cells, vstat_draws); }
         snprintf(key, sizeof key, ",%u,", t + 1);
         if (strstr(list, key)) { snprintf(name, sizeof name, "vhost_%05u.ppm", t + 1); shot(name); }
     }
