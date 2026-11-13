@@ -77,6 +77,15 @@ Found in the first port; look for them in every game with the profiler (`src/pro
 Hand-written routines: guard them (fall back to `.orig`), reproduce registers, all four flags, RAM and the
 return addresses left on the stack page, and prove them with the per-tick checksum.
 
+## 4b. Frame time: work on the worst frame, not the average
+
+The kit's loop runs every tick due before drawing. Once one frame needs two vblanks, the next runs two ticks
+and (if logic + logic + display > 71k) stays at 25 Hz however cheap the average frame is. Measure the
+distribution of one tick + one picture (`tools/framestat.py` on a `tools/debug_run.sh` build with `-DNOVP`) and cut
+the bursts (nametable rewrites, tile-set uploads, sprite-cache misses) as much as the median. On fast RAM every
+68k instruction costs ~3-4 colour clocks: count instructions; per-register I/O helpers, a pointer cache for
+`(zp),Y`, and caches keyed by content (CHR RAM tile hashes) were the wins.
+
 ## 5. Translator rules of thumb
 
 - 68k back end, not C, on the Amiga (C costs 3× more: registers through globals at every call).
@@ -140,7 +149,8 @@ sections above if a lesson is general.
 
 - Load: 7,450 average, 8,700 max 6502 instructions per frame in play (no demo mode: scripted play from START);
   title screens 500-1,900. PAL, so one tick per Amiga frame.
-- Result: checksum equal on both machines over 3,000 ticks; 13.8 fps stock, 21.9 fps with 4 MB fast RAM.
+- Result: checksum equal on both machines over 3,000 ticks; 18.1 fps stock, 30.5 fps with 4 or 8 MB fast RAM
+  (first build 11.5 / 17.4).
   Fast RAM: logic ~53k colour clocks a tick, display ~80k a frame (51 NES sprites on screen).
 - New: AxROM bank model in the translator, NMI-driven idle-loop frame model, CHR RAM, PAL reference timing, a
   status bar split shown by blitting the bar under the view, 7-channel sprite allocation, `tools/prof.py`.

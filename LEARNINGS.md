@@ -57,10 +57,29 @@ What bought speed: PPU register and `$2007`/`$4017` read fast paths (about 100 C
 21.9; display: no nametable scan for unseen tiles, the bar re-rendered only when its own tiles change,
 sprite cache invalidated per tile instead of entirely.
 
+## 3b. The second round: 22.9 -> 30.5 fps on fast RAM (stock 14.1 -> 18.1)
+
+| Change | Effect |
+| --- | --- |
+| Lean helper per PPU register and the bank register (no address tests, no register saves) | 22.9 -> 26.0 fps |
+| Status bar: per-cell updates of its bitmap, queued blits, per-line validity of the row it cuts | display 70k -> 53k |
+| Sprite cluster pool in fast RAM (1 MB), signatures from tile *content* hashes (CHR RAM animation hits) | hits 74% -> 88%, 26.6 -> 28.3 |
+| Grouping first pass in assembly; JMP (ind) caches; (zp),Y pointer cache in a6; column copy by hand | +1.5 fps |
+| 32-pixel hardware sprites (half the chip copies; a few more dropped clusters) | +0.3 fps |
+
+**The kit loop locks at 25 Hz.** In play 70% of frames could show one tick plus a picture inside 71k
+(median 66k), but one frame over makes the next run two ticks (~66k logic + display ~98k), which never fits:
+the loop stays at two vblanks a frame with ~44k idle each. Average cost hardly moves the frame rate until the
+*worst* single-tick frame fits; work on the tail (bursts), not the mean. `tools/framestat.py` shows it.
+
+What did not help: moving the sprite cache from chip to fast RAM alone, power-of-two array strides, skipping
+unchanged sprite-list slots (half the copies were already skippable); 4 vs 8 MB fast RAM (identical).
+Profiler pitfall: a timer call per small item (per cell, per cluster) costs more than the item; time blocks.
+
 ## 4. What to try next (fast RAM, play)
 
-1. Sprites: 51 visible NES sprites a frame; clustering and rendering in C cost ~40k. Grouping in assembly and
-   keeping clusters across frames (the scenery moves with the scroll) are the next big display item.
+1. The tail: 90th percentile one tick + picture is 82k (needs < 71k for 50 Hz, < 57k for the gate). Sprites
+   ~27k a frame (per-cluster work in C ~18k: control words, signatures, chip copies, misses), logic 33k.
 2. The straddling tile row under the bar is redrawn every frame the view moves (~40 tiles): draw only the lines
    above the bar, or move the bar blit to the tile boundary.
 3. Logic: profile again restricted to play; `(zp),y` reads through `_rd_ea` (the decompressor at bank 1 $8430

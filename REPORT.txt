@@ -3,25 +3,25 @@ Game:                  Cobra Triangle (Rare 1989), NES, European PAL release (ma
 Class and route:       Assembly/binary for a 6502 machine: translated once on the host (tools/recomp.py) to 68k
                        assembly (tools/back68k.py); NES video, sound and input replaced by src/video.c, src/sound.c,
                        src/nes.c and the kit
-Display:               planes=4 scroll=1 fetch=0 buffers=1 sprites used=7 (0-6: 3 attached pairs or 6 singles + 6)
+Display:               planes=4 scroll=1 fetch=0 buffers=1 sprites used=7 (32 pixels wide; attached pairs or singles)
                        colours=16 playfield/status bar + 16 sprite (NES palettes)
 Busiest moment:        play: 51 NES sprites on average, diagonal scrolling, status bar redrawn under the view.
                        Not a budget sum: the logic alone is ~96k colour clocks a tick on the stock machine
-                       (135% of a frame) and ~45k on 4 or 8 MB fast RAM (63%); the display ~53k a frame on
-                       fast RAM (sprites ~40k of it)
+                       (135% of a frame) and ~33k on 4 or 8 MB fast RAM (46%); the display ~33k a frame on
+                       fast RAM (median; sprites ~27k of it, 90th percentile 48k)
 Cut from the original: cycle-timed raster effects (their result is shown: the status bar; their timing is not),
                        lag frames (the translated logic always finishes its frame; the NES lags about once in 750
                        play frames), DMC samples, sprite-behind-background priority, colour emphasis bits
-Stock A1200 bench:     frames=999 late=2523 worst_cck=2638762 avg_cck=207114 budget_cck=71051 worst_pct=3713 avg_pct=291 display_hz=50 shown_fps=14.1
+Stock A1200 bench:     frames=1119 late=1963 worst_cck=1991037 avg_cck=147227 budget_cck=71051 worst_pct=2802 avg_pct=207 display_hz=50 shown_fps=18.1
                        ticks=3000 checksum=21a7571d  (FS-UAE 3.1.66, A1200 model, AROS ROM)
-With 4 MB fast RAM:    frames=1402 late=1649 worst_cck=1672779 avg_cck=105228 budget_cck=71051 worst_pct=2354 avg_pct=148 display_hz=50 shown_fps=22.9
+With 4 MB fast RAM:    frames=1850 late=1181 worst_cck=1336425 avg_cck=65809 budget_cck=71051 worst_pct=1880 avg_pct=92 display_hz=50 shown_fps=30.5
                        ticks=3000 checksum=21a7571d
-With 8 MB fast RAM:    the same line (4 and 8 MB give identical results)
+With 8 MB fast RAM:    the same line (4 and 8 MB give identical results; the sprite cache uses 1 MB)
 Kickstart 3.1 (40.68):  (previous build, before the display work) frames=998 late=2605 worst_cck=2636297 avg_cck=212858 budget_cck=71051 worst_pct=3710 avg_pct=299 display_hz=50 shown_fps=13.8
                        ticks=3000 checksum=21a7571d  (the user's Commodore ROM via --kickstart_file, stock A1200;
                        takeover and return to the AmigaDOS shell checked on a screenshot)
 Host checksum:         21a7571d after 3000 ticks  equal (stock and fast RAM)
-Frame rate claim:      14.1 fps shown on the stock A1200, 22.9 fps with 4 or 8 MB fast RAM, logic at 50 ticks (game
+Frame rate claim:      18.1 fps shown on the stock A1200, 30.5 fps with 4 or 8 MB fast RAM, logic at 50 ticks (game
                        time exact). 50 Hz NOT held: tools/port.sh prints FAIL (late, worst_pct). The stock machine
                        cannot hold 50 Hz by translation (load measured on day one: 7,450-8,700 6502 instructions a
                        frame); the cheapest upgrade that might, with more hand-written routines, is fast RAM; a
