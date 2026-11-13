@@ -15,10 +15,11 @@ import sys
 d = open(sys.argv[1], 'rb').read()
 assert d[:4] == b'NES\x1a', 'not an iNES file'
 mapper = (d[6] >> 4) | (d[7] & 0xf0)
-assert d[4] == 8 and d[5] == 16 and mapper == 1, ('only 128K PRG + 128K CHR MMC1 games are supported so far '
+ok = (mapper == 1 and d[4] == 8 and d[5] == 16) or (mapper == 7 and d[4] == 8 and d[5] == 0)
+assert ok, ('supported so far: MMC1 with 128K PRG + 128K CHR ROM, AxROM with 128K PRG + CHR RAM '
     '(this ROM: %d x 16K PRG, %d x 8K CHR, mapper %d): see PLAYBOOK-NES.md section 8' % (d[4], d[5], mapper))
-open('assets/prg.bin', 'wb').write(d[16:16 + 0x20000])
-open('assets/chr.bin', 'wb').write(d[16 + 0x20000:16 + 0x40000])
+open('assets/prg.bin', 'wb').write(d[16:16 + d[4] * 0x4000])
+open('assets/chr.bin', 'wb').write(d[16 + d[4] * 0x4000:16 + d[4] * 0x4000 + d[5] * 0x2000])   # empty with CHR RAM
 PY
 FLOWS=$(ls tools/flow/*.txt 2>/dev/null | grep -v "_input.txt" || true)    # traces from tools/nesref -c; none is fine to start
 python3 tools/recomp.py --game "$GAME" "$ROM" src $FLOWS

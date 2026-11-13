@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "nes.h"
+#include "gen_code.h"                   /* NES_MAPPER */
 
 uint8_t nes_prg_data[0x20000], nes_chr_data[0x20000];
 void nes_wait(int kind, uint16_t pc) { (void)kind; (void)pc; }
@@ -19,7 +20,7 @@ static uint8_t A, X, Y, S = 0xfd, P = 0x24; static uint16_t PC, pc0;
 static struct { int bank; uint16_t br, loop; int kind; } waits[64]; static int nwaits;
 static int s0at[0x10000];
 
-static int bank_of(uint16_t a) { return a >= 0xc000 ? 7 : nes_bank; }
+static int bank_of(uint16_t a) { return (nes_mapper == 7 || a < 0xc000) ? nes_bank : 7; }
 static uint8_t rd(uint16_t a)
 {
     if (a == 0x2002 && s0at[pc0] && s0at[pc0] - 1 == bank_of(pc0)) return nes_read_s0();
@@ -107,7 +108,9 @@ static int step(void)
             for (k = 0; k < nwaits; k++) if (waits[k].br == pc0 && waits[k].bank == bank_of(pc0)) return 1 + waits[k].kind;
         }
     } break;
-    case 0x4c: PC = a; break;
+    case 0x4c: PC = a;
+        for (k = 0; k < nwaits; k++) if (waits[k].br == pc0 && waits[k].bank == bank_of(pc0) && waits[k].kind == 2) return 3;
+        break;
     case 0x6c: PC = (uint16_t)(rd(a) | (rd((uint16_t)((a & 0xff00) | ((a + 1) & 0xff))) << 8)); break;
     case 0x20: push((uint8_t)((PC - 1) >> 8)); push((uint8_t)(PC - 1)); PC = a; break;
     case 0x60: PC = (uint16_t)((pop() | (pop() << 8)) + 1); break;
@@ -125,13 +128,17 @@ static int step(void)
 static unsigned short bench_input(unsigned int t)      /* copy of game_bench_input() in src/logic.c */
 {
     /* BENCH INPUT BEGIN (per game: tools/new_port.sh resets it) */
-    if (t >= 100 && t <= 105) return 64;
-    if (t >= 200 && t <= 205) return 4;
-    if (t >= 250 && t <= 255) return 16;
-    if (t >= 330 && t <= 335) return 4;
-    if (t >= 360 && t <= 365) return 4;
-    if (t >= 400 && t <= 405) return 16;
-    if (t >= 500 && (t & 127) < 4) return 16;
+    /* Cobra Triangle has no demo mode: START through the title screens, then scripted play from tick 740:
+       16-tick segments of steering (all eight directions), fire (A) in most of them, turbo (B) in some. */
+    static const unsigned short dirs[16] = { 8, 9, 1, 5, 4, 6, 2, 10, 8, 9, 8, 1, 9, 10, 0, 8 };
+    unsigned h, in;
+    if ((t >= 480 && t < 484) || (t >= 600 && t < 604)) return 64;       /* IN_START */
+    if (t < 740) return 0;
+    h = (t >> 4) * 2654435761u; h ^= h >> 15; h *= 2246822519u; h ^= h >> 13;
+    in = dirs[(h >> 4) & 15];
+    if ((h & 3) != 0 && (t & 8)) in |= 16;                              /* IN_A, pressed and released */
+    if (((h >> 8) & 7) == 0) in |= 32;                                   /* IN_B */
+    return (unsigned short)in;
     /* BENCH INPUT END */
     return 0;
 }
@@ -147,35 +154,43 @@ int main(int argc, char **argv)
 {
     unsigned n = (unsigned)atoi(argv[1]), t; FILE *log = fopen(argv[2], "wb"), *f; char line[128];
     int kind = -1;
-    f = fopen("assets/prg.bin", "rb"); if (!f || fread(nes_prg_data, 1, 0x20000, f) != 0x20000) return 2; fclose(f);
-    f = fopen("assets/chr.bin", "rb"); if (!f || fread(nes_chr_data, 1, 0x20000, f) != 0x20000) return 2; fclose(f);
+    f = fopen("assets/prg.bin", "rb"); if (!f || fread(nes_prg_data, 1, 0x20000, f) != NES_PRG_SIZE) return 2; fclose(f);
+    f = fopen("assets/chr.bin", "rb"); if (!f || fread(nes_chr_data, 1, 0x20000, f) != NES_CHR_SIZE) return 2; fclose(f);
     f = fopen("src/gen_waits.txt", "r");
     while (f && fgets(line, sizeof line, f)) {
         int b; unsigned br, lp; char k[8];
         if (sscanf(line, "%d %x %x %7s", &b, &br, &lp, k) != 4) continue;
         if (!strcmp(k, "S0")) { s0at[br] = b + 1; continue; }
         waits[nwaits].bank = b; waits[nwaits].br = (uint16_t)br; waits[nwaits].loop = (uint16_t)lp;
-        waits[nwaits].kind = !strcmp(k, "VBL"); nwaits++;
+        waits[nwaits].kind = !strcmp(k, "VBL") ? 1 : !strcmp(k, "IDLE") ? 2 : 0; nwaits++;
     }
     if (f) fclose(f);
-    nes_init(nes_prg_data, nes_chr_data);
+    nes_init(nes_prg_data, NES_CHR_SIZE ? nes_chr_data : 0, NES_MAPPER);
     PC = (uint16_t)(nes_rd(0xfffc) | nes_rd(0xfffd) << 8);
     for (t = 0; t < n; t++) {
         nes_pad = pad_of(bench_input(t));
-        if (kind >= 0) {                                /* start of a frame after a wait: NMI, then the vblank flag */
+        if (kind == 2) {                                /* idle (a jump to itself): the NMI runs until the next wait */
+            if (ppu_ctrl & 0x80) {
+                push((uint8_t)(PC >> 8)); push((uint8_t)PC); push((uint8_t)((P & ~0x10) | 0x20)); P |= FI;
+                PC = (uint16_t)(nes_rd(0xfffa) | nes_rd(0xfffb) << 8);
+            }
+        } else if (kind >= 0) {                         /* start of a frame after a wait: NMI, then the vblank flag */
             if (ppu_ctrl & 0x80) {
                 uint16_t back = PC; uint8_t s0 = S;
                 push((uint8_t)(PC >> 8)); push((uint8_t)PC); push((uint8_t)((P & ~0x10) | 0x20)); P |= FI;
                 PC = (uint16_t)(nes_rd(0xfffa) | nes_rd(0xfffb) << 8);
                 split_seen = 0;
                 while (!(PC == back && S == s0)) {
-                    if (step()) { fprintf(stderr, "verify: wait inside the NMI at tick %u\n", t); return 3; }
+                    int r = step();
+                    if (r == 3) { kind = 2; goto frame_done; }      /* the NMI idles: the main thread is gone */
+                    if (r) { fprintf(stderr, "verify: wait inside the NMI at tick %u\n", t); return 3; }
                 }
                 split_on = split_seen;
             }
             if (kind == 1) ppu_vbl = 1;
         }
         for (;;) { int r = step(); if (r) { kind = r - 1; break; } }
+    frame_done:
         fwrite(nes_ram, 1, sizeof nes_ram, log);
     }
     fclose(log);

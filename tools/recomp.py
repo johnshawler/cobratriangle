@@ -37,35 +37,58 @@ sys.argv = [sys.argv[0]] + args
 rom = open(sys.argv[1], 'rb').read()
 nprg = rom[4]
 prg = rom[16:16 + nprg * 16384]
-FIXED = nprg - 1
+MAPPER = (rom[6] >> 4) | (rom[7] & 0xf0)
 outdir = sys.argv[2]
+# Bank models. MMC1 (mapper 1): 16 KB banks, bank number = 16 KB bank, the last one fixed at $C000.
+# AxROM (mapper 7): 32 KB banks switched as a whole, bank number = 32 KB bank, nothing fixed (FIXED = -1).
+# In AxROM a write to $8000-$FFFF switches the bank under the running code: the translated function ends
+# there and the code after it is dispatched in whatever bank is then mapped (see successors(), mapper_write()).
+AX = MAPPER == 7
+if AX:
+    NBANKS = nprg // 2
+    FIXED = -1
+else:
+    NBANKS = nprg
+    FIXED = nprg - 1
 
 def rd(ctx, a):
     a &= 0xffff
+    if AX:
+        if a >= 0x8000: return prg[ctx * 0x8000 + a - 0x8000]
+        return 0x02
     if a >= 0xc000: return prg[FIXED * 0x4000 + a - 0xc000]
     if a >= 0x8000: return prg[ctx * 0x4000 + a - 0x8000]
     return 0x02                 # not ROM: decodes as an unknown opcode
 
 def ctx_of(ctx, a):
     """bank a code address belongs to, seen from code running with switchable bank ctx (7 = unknown)"""
+    if AX: return ctx
     return FIXED if a >= 0xc000 else ctx
+
+def vec_banks():
+    """(bank, vector table base) pairs to read the reset/NMI/IRQ vectors from"""
+    return [(b, b * 0x8000 + 0x7ffa) for b in range(NBANKS)] if AX else [(FIXED, FIXED * 0x4000 + 0x3ffa)]
 
 # ---------------------------------------------------------------- inputs
 executed = set(); entries = set(); dyn = collections.defaultdict(set)
-reset = prg[FIXED * 0x4000 + 0x3ffc] | prg[FIXED * 0x4000 + 0x3ffd] << 8
-nmi = prg[FIXED * 0x4000 + 0x3ffa] | prg[FIXED * 0x4000 + 0x3ffb] << 8
-irq = prg[FIXED * 0x4000 + 0x3ffe] | prg[FIXED * 0x4000 + 0x3fff] << 8
-entries |= {(FIXED, reset), (FIXED, nmi), (FIXED, irq)}
+vectors = set()                 # (bank, address) of every reset/NMI/IRQ entry
+for vb, base in vec_banks():
+    for k in (0, 2, 4): vectors.add((vb, prg[base + k] | prg[base + k + 1] << 8))
+RESET_BANK = 0 if AX else FIXED                 # AxROM boots in bank 0 (the reference and the port agree)
+reset = prg[vec_banks()[0][1] + 2] | prg[vec_banks()[0][1] + 3] << 8
+nmi = prg[vec_banks()[0][1]] | prg[vec_banks()[0][1] + 1] << 8
+irq = prg[vec_banks()[0][1] + 4] | prg[vec_banks()[0][1] + 5] << 8
+entries |= vectors
 for fn in sys.argv[3:]:
     for line in open(fn):
         p = line.split()
         if not p: continue
         if p[0] == 'E': executed.add((int(p[1]), int(p[2], 16)))
-        elif p[0] in 'IUX':
+        elif p[0] in 'IUXB':
             b, to = int(p[1]), int(p[2], 16)
             if to < 0x8000: continue
-            entries.add((FIXED if to >= 0xc000 else b, to))
-            dyn['all'].add((FIXED if to >= 0xc000 else b, to))
+            entries.add((ctx_of(b, to), to))
+            dyn['all'].add((ctx_of(b, to), to))
             if p[0] == 'I': dyn['I'].add((b, to))
 
 # ---------------------------------------------------------------- decoding
@@ -91,12 +114,21 @@ def static_branch(ctx, a, prev):
     if pm == 'CLV' and m in ('BVC', 'BVS'): return m == 'BVC'
     return None
 
+def mapper_write(d):
+    """AxROM: does this instruction write the bank register? (a store to $8000-$FFFF)"""
+    if not AX or not d: return False
+    m, mode, arg, n = d
+    if m not in ('STA', 'STX', 'STY', 'INC', 'DEC', 'ASL', 'LSR', 'ROL', 'ROR'): return False
+    if mode in ('abs', 'abx', 'aby') and arg >= 0x8000 - (255 if mode != 'abs' else 0): return True
+    return False
+
 def successors(ctx, a, prev):
     """(fallthrough?, list of local jump targets, call target or None)"""
     d = insn(ctx, a)
     if not d: return False, [], None
     m, mode, arg, n = d
     if m in ('RTS', 'RTI', 'BRK'): return False, [], None
+    if mapper_write(d): return False, [], None          # the code after it runs in the bank just mapped
     if m == 'JMP': return False, ([arg] if mode == 'abs' else []), None
     if m == 'JSR': return (arg not in NORETURN), [], arg
     if mode == 'rel':
@@ -123,15 +155,30 @@ def body(ctx, entry, stop_at_entries):
             work.append((t, d))
     return sorted(seen)
 
+def same_code(b1, b2, a, n=24):
+    return all(rd(b1, a + i) == rd(b2, a + i) for i in range(n))
+
 # fixpoint over JSR targets
 while True:
     new = set()
     for (ctx, e) in list(entries):
+        prevd = None
         for a in body(ctx, e, False):
             d = insn(ctx, a)
+            if mapper_write(d):
+                # the continuation: in the bank the stored value names (LDA/LDX/LDY #imm just before), and in
+                # every bank that has the same code there (common code). The traces add the others ('B' lines).
+                nx = (a + d[3]) & 0xffff
+                reg = {'STA': 'LDA', 'STX': 'LDX', 'STY': 'LDY'}.get(d[0])
+                if prevd and prevd[0] == reg and prevd[1] == 'imm': new.add(((prevd[2] & 7) % NBANKS, nx))
+                for b in range(NBANKS):
+                    if same_code(ctx, b, nx): new.add((b, nx))
+            prevd = d
             if d and d[0] == 'JSR':
                 t = d[2]
-                if t >= 0xc000: new.add((FIXED, t))
+                if AX:
+                    if t >= 0x8000: new.add((ctx, t))
+                elif t >= 0xc000: new.add((FIXED, t))
                 elif t >= 0x8000 and (ctx != FIXED and a < 0xc000): new.add((ctx, t))
                 elif t >= 0x8000 and ctx != FIXED: new.add((ctx, t))
             if d and d[0] == 'JSR' and d[2] in NORETURN:      # the words after it are jump targets
@@ -139,7 +186,7 @@ while True:
                 for k in range(64):
                     w = rd(ctx, tb + 2 * k) | rd(ctx, tb + 2 * k + 1) << 8
                     if w < 0x8000 or (ctx == FIXED and w < 0xc000 and (ctx, w) not in entries): break
-                    if (ctx_of(ctx, w), w) in executed or (FIXED if w >= 0xc000 else ctx, w) in dyn['I']:
+                    if (ctx_of(ctx, w), w) in executed or (ctx_of(ctx, w), w) in dyn['I']:
                         new.add((ctx_of(ctx, w), w)); dyn['all'].add((ctx_of(ctx, w), w))
     new -= entries
     if not new: break
@@ -153,6 +200,10 @@ _UD = {'LDA': ('', 'a'), 'LDX': ('', 'x'), 'LDY': ('', 'y'), 'BIT': ('', ''), 'A
        'ASL': ('a', 'a'), 'LSR': ('a', 'a'), 'NOP': ('', '')}
 
 def wait_kind(ctx, start, br):
+    if start == br: return 'IDLE'           # a branch to itself: nothing but an interrupt ends it
+    return wait_kind2(ctx, start, br)
+
+def wait_kind2(ctx, start, br):
     """the loop start..br (br = the branch back) can only end when an interrupt changes memory:
     it writes nothing, reads fixed addresses only, and sets every register before using it.
     RAM poll -> 'RAM', $2002 with a bit 7 test -> 'VBL', with a bit 6 test -> 'S0'"""
@@ -171,15 +222,48 @@ def wait_kind(ctx, start, br):
         a += n
     if not reads or (a - start) > 16: return None
     if 0x2002 in reads:
-        return 'S0' if bits & {'BVC', 'BVS'} else 'VBL'
+        if bits & {'BVC', 'BVS'}: return 'S0'
+        # BIT $2002 with BEQ/BNE tests A & $2002: A set by LDA #imm just before the loop says which bit
+        if bits & {'BEQ', 'BNE'} and rd(ctx, start - 2) == 0xa9 and rd(ctx, start - 1) & 0x40 and not rd(ctx, start - 1) & 0x80:
+            return 'S0'
+        return 'VBL'
     if all(r < 0x2000 for r in reads): return 'RAM'
     return None
+
+# ---------------------------------------------------------------- AxROM: which functions may return in another bank
+# A function may leave another bank mapped when it writes the bank register (it ends there and the rest runs
+# dispatched), or calls or jumps to one that may. After a JSR to such a function the caller checks the bank.
+may_switch = set()
+if AX:
+    changed = True
+    while changed:
+        changed = False
+        for (ctx, e) in entries:
+            if (ctx, e) in may_switch: continue
+            hit = False
+            bset = set(body(ctx, e, True))
+            for a in sorted(bset):
+                d = insn(ctx, a)
+                if not d: continue
+                if mapper_write(d) or (d[0] == 'JMP' and d[1] == 'ind'): hit = True; break
+                t = None
+                if d[0] == 'JSR' or (d[0] == 'JMP' and d[1] == 'abs') or d[1] == 'rel': t = d[2]
+                if t is None or (t in bset and d[0] != 'JSR'): continue
+                if t < 0x8000 or (ctx, t) not in entries or (ctx, t) in may_switch: hit = True; break
+            if hit: may_switch.add((ctx, e)); changed = True
+
+def bank_check(ctx, t):
+    """AxROM: after a JSR to t from bank ctx, must the caller check that its bank is still mapped?"""
+    return AX and (t < 0x8000 or (ctx, t) in may_switch or (ctx, t) not in entries)
 
 # ---------------------------------------------------------------- C generation
 def fname(ctx, a): return 'F%d_%04x' % (ctx_of(ctx, a), a)
 
 def call_expr(ctx, at, t):
     """C expression that runs the subroutine at t, called from code at address 'at' in a function of bank ctx"""
+    if AX:
+        if t >= 0x8000 and (ctx, t) in entries: return fname(ctx, t) + '()'
+        return 'nes_dispatch(0x%04x)' % t
     if t >= 0xc000: return fname(FIXED, t) + '()'
     if t < 0x8000: return 'nes_dispatch(0x%04x)' % t
     if ctx == FIXED: return 'nes_dispatch(0x%04x)' % t
@@ -198,7 +282,8 @@ def operand(ctx, m, mode, arg, s0):
         return '', e, e + ' = {v};'
     if mode == 'abs':
         if arg < 0x2000: return '', 'M[0x%03x]' % (arg & 0x7ff), 'M[0x%03x] = {v};' % (arg & 0x7ff)
-        if arg >= 0xc000: rde = 'P[0x%05x]' % (FIXED * 0x4000 + arg - 0xc000)
+        if AX and arg >= 0x8000: rde = 'P[0x%05x]' % (ctx * 0x8000 + arg - 0x8000)
+        elif arg >= 0xc000: rde = 'P[0x%05x]' % (FIXED * 0x4000 + arg - 0xc000)
         elif arg >= 0x8000: rde = 'nes_prg_lo[0x%04x]' % (arg - 0x8000)
         elif arg == 0x2002 and s0: rde = 'nes_read_s0()'
         else: rde = 'nes_io_read(0x%04x)' % arg
@@ -207,6 +292,8 @@ def operand(ctx, m, mode, arg, s0):
         r = mode[-1]
         if arg + 255 < 0x800: e = 'M[0x%03x + %s]' % (arg, r); return '', e, e + ' = {v};'
         if arg + 255 < 0x2000: e = 'M[(0x%04x + %s) & 0x7ff]' % (arg, r); return '', e, e + ' = {v};'
+        if AX and arg >= 0x8000 and arg + 255 <= 0xffff:
+            return 'ea = 0x%04x + %s;' % (arg, r), 'P[0x%05x + %s]' % (ctx * 0x8000 + arg - 0x8000, r), 'nes_write_slow(ea, {v});'
         if arg >= 0xc000 and arg + 255 <= 0xffff:
             return 'ea = 0x%04x + %s;' % (arg, r), 'P[0x%05x + %s]' % (FIXED * 0x4000 + arg - 0xc000, r), 'nes_write_slow(ea, {v});'
         if arg >= 0x8000 and arg + 255 < 0xc000:
@@ -244,6 +331,8 @@ def gen_function(ctx, entry):
                     if d[2] <= x <= a: s0_loops.add(x); s0_found.add((ctx_of(ctx, x), x))
             elif k:
                 waits[a] = (k, d[2]); waits_found.append((ctx_of(ctx, a), a, d[2], k))
+        if d and d[0] == 'JMP' and d[1] == 'abs' and d[2] == a:             # JMP to itself: idle until the NMI
+            waits[a] = ('IDLE', a); waits_found.append((ctx_of(ctx, a), a, a, 'IDLE'))
     # also the exit-branch form of the sprite 0 wait: BIT $2002 / BMI out / BVC back
     body_lines = []
     prev = None
@@ -311,7 +400,9 @@ def gen_function(ctx, entry):
         elif mode == 'rel':
             sb = static_branch(ctx, a, prev)
             cond = BR[m]
-            if a in waits:
+            if a in waits and waits[a][0] == 'IDLE':
+                L.append('if (%s) { SAVE; nes_idle(0x%04x); return 0; }' % (cond, a))
+            elif a in waits:
                 kind, lp = waits[a]
                 labels.add(lp)
                 L.append('if (%s) { SAVE; nes_wait(%s, 0x%04x); LOAD; goto L_%04x; }' % (cond, 'WAIT_' + kind, lp, lp))
@@ -322,7 +413,8 @@ def gen_function(ctx, entry):
                 if arg in aset: labels.add(arg); L.append('if (%s) goto L_%04x;' % (cond, arg))
                 else: L.append('if (%s) { SAVE; return %s; }' % (cond, call_expr(ctx, a, arg)))
         elif m == 'JMP':
-            if mode == 'abs':
+            if a in waits: L.append('SAVE; nes_idle(0x%04x); return 0;' % a)
+            elif mode == 'abs':
                 if arg in aset: labels.add(arg); L.append('goto L_%04x;' % arg)
                 else: L.append('SAVE; return %s;' % call_expr(ctx, a, arg))
             else:
@@ -337,6 +429,7 @@ def gen_function(ctx, entry):
                 L.append('SAVE; return %s;' % call_expr(ctx, a, arg))
             else:
                 L.append('SAVE; r = %s; if (r != 0x%04x) return r; LOAD;' % (call_expr(ctx, a, arg), (ret + 1) & 0xffff))
+                if bank_check(ctx, arg): L.append('if (nes_bank != %d) return nes_dispatch(0x%04x);' % (ctx, (ret + 1) & 0xffff))
         elif m == 'RTS':
             L.append('s++; t = M[0x100 + s]; s++; t |= M[0x100 + s] << 8; SAVE; return (uint16_t)(t + 1);')
         elif m == 'RTI':
@@ -346,6 +439,7 @@ def gen_function(ctx, entry):
             L.append('SAVE; nes_fatal(0x%04x, 2); return 0;' % a)
         else:
             raise ValueError(m)
+        if mapper_write(d): L.append('SAVE; return nes_dispatch(0x%04x);' % fall)    # continue in the new bank
         # fallthrough into an instruction that is not emitted next
         ft, _, _ = successors(ctx, a, prev)
         if m in ('JSR',) and arg in NORETURN: ft = False
@@ -387,17 +481,21 @@ for ctx in range(nprg):                 # every bank gets a file, even without c
         if not byctx.get(ctx): f.write('typedef int gen_bank%d_is_empty;\n' % ctx)
     decls += ['uint16_t %s(void);' % fname(ctx, e) for e in byctx.get(ctx, [])]
 with open(os.path.join(outdir, 'gen_code.h'), 'w') as f:
-    f.write('/* generated by tools/recomp.py: do not edit */\n' + '\n'.join(decls) + '\n#define NES_NMI_FN %s\n#define NES_RESET_FN %s\n' % (fname(FIXED, nmi), fname(FIXED, reset)))
+    f.write('/* generated by tools/recomp.py: do not edit */\n' + '\n'.join(decls) + '\n#define NES_RESET_FN %s\n' % fname(RESET_BANK, reset))
+    f.write('#define NES_MAPPER %d\n#define NES_PRG_SIZE 0x%x\n#define NES_CHR_SIZE 0x%x\n' % (MAPPER, nprg * 0x4000, rom[5] * 0x2000))
 with open(os.path.join(outdir, 'gen_dispatch.c'), 'w') as f:
-    f.write(HDR + '#include "gen_code.h"\n\nuint16_t nes_dispatch(uint16_t pc)\n{\n    if (pc >= 0xc000) switch (pc) {\n')
-    for e in byctx[FIXED]: f.write('    case 0x%04x: return %s();\n' % (e, fname(FIXED, e)))
+    f.write(HDR + '#include "gen_code.h"\n\nuint16_t nes_dispatch(uint16_t pc)\n{\n')
+    if AX: f.write('    if (0) {\n')
+    else:
+        f.write('    if (pc >= 0xc000) switch (pc) {\n')
+        for e in byctx[FIXED]: f.write('    case 0x%04x: return %s();\n' % (e, fname(FIXED, e)))
     f.write('    } else if (pc >= 0x8000) switch (nes_bank) {\n')
     for ctx in sorted(byctx):
         if ctx == FIXED: continue
         f.write('    case %d: switch (pc) {\n' % ctx)
         for e in byctx[ctx]: f.write('        case 0x%04x: return %s();\n' % (e, fname(ctx, e)))
         f.write('        } break;\n')
-    f.write('    }\n    nes_fatal(pc, 3);\n    return 0;\n}\n\nuint16_t nes_reset_entry(void) { return %s(); }\n' % fname(FIXED, reset))
+    f.write('    }\n    nes_fatal(pc, 3);\n    return 0;\n}\n\nuint16_t nes_reset_entry(void) { return %s(); }\n' % fname(RESET_BANK, reset))
 with open(os.path.join(outdir, 'gen_waits.txt'), 'w') as f:
     for w in sorted(set(waits_found)): f.write('%d %04x %04x %s\n' % w)
     for b, x in sorted(s0_found): f.write('%d %04x 0000 S0\n' % (b, x))
@@ -413,5 +511,5 @@ if miss: print('not decoded, first:', ' '.join('%d:%04x' % x for x in miss[:20])
 
 # ---------------------------------------------------------------- the 68k assembly back end
 import back68k
-dynamic_entries = dyn['all'] | {(FIXED, reset), (FIXED, nmi), (FIXED, irq)}
+dynamic_entries = dyn['all'] | vectors | {(c, e) for (c, e) in entries if AX}   # AxROM: anything may be dispatched
 back68k.generate(globals())
