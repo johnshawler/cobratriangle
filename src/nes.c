@@ -5,7 +5,10 @@
 uint8_t cpu_a, cpu_x, cpu_y, cpu_s = 0xfd, cpu_c, cpu_z = 1, cpu_n, cpu_v, cpu_i = 1, cpu_d;
 uint8_t nes_ram[0x800];
 const uint8_t *nes_prg, *nes_chr, *nes_prg_lo, *nes_prg_hi;
-uint8_t nes_bank;
+uint8_t nes_bank, nes_mapper = 1, ax_reg;
+uint16_t nt_map[4];
+uint8_t  nes_chr_ram[0x2000], chr_dirty_flag[512];
+uint16_t chr_dirty[512], chr_ndirty;
 uint16_t nes_fatal_pc; int nes_fatal_why;
 
 uint8_t nes_vram[0x800], nes_pal[32], nes_oam[256];
@@ -21,6 +24,7 @@ uint16_t nes_ndirty;
 uint8_t  nes_dirty_flag[0x800];
 uint8_t  nes_redraw_all = 1, nes_pal_dirty = 1;
 
+uint8_t  split_ax;
 uint8_t  split_on, split_ctrl, split_chr0, split_chr1, split_fx, split_line, split_seen;
 uint16_t split_t;
 
@@ -28,8 +32,29 @@ uint8_t apu_reg[0x18], apu_trig;
 uint8_t nes_pad;
 uint8_t pad_shift, pad_strobe;                 /* also used by src/nes68k.s */
 
+static void set_mirroring(void)
+{
+    int i;
+    for (i = 0; i < 4; i++) {
+        if (nes_mapper == 7) nt_map[i] = (ax_reg & 0x10) ? 0x400 : 0;
+        else switch (mmc_ctrl & 3) {
+        case 0: nt_map[i] = 0; break;
+        case 1: nt_map[i] = 0x400; break;
+        case 2: nt_map[i] = (uint16_t)((i & 1) << 10); break;       /* vertical */
+        default: nt_map[i] = (uint16_t)((i >> 1) << 10); break;     /* horizontal */
+        }
+    }
+}
+
 static void map_prg(void)
 {
+    if (nes_mapper == 7) {
+        nes_bank = ax_reg & 3;
+        nes_prg_lo = nes_prg + nes_bank * 0x8000;
+        nes_prg_hi = nes_prg_lo + 0x4000;
+        return;
+    }
+    {
     int mode = (mmc_ctrl >> 2) & 3, b = mmc_prg & 0x0f;
     int lo, hi;
     if (mode < 2) { lo = b & 0x0e; hi = lo | 1; }
@@ -39,12 +64,15 @@ static void map_prg(void)
     nes_bank = (uint8_t)lo;
     nes_prg_lo = nes_prg + lo * 0x4000;
     nes_prg_hi = nes_prg + hi * 0x4000;
+    }
 }
 
-void nes_init(const uint8_t *prg, const uint8_t *chr)
+void nes_init(const uint8_t *prg, const uint8_t *chr, int mapper)
 {
-    nes_prg = prg; nes_chr = chr;
+    nes_mapper = (uint8_t)mapper;
+    nes_prg = prg; nes_chr = chr ? chr : nes_chr_ram;
     map_prg();
+    set_mirroring();
 }
 
 void nes_fatal(uint16_t pc, int why)
@@ -55,13 +83,7 @@ void nes_fatal(uint16_t pc, int why)
 /* index into nes_vram for a PPU address $2000-$2FFF, after mirroring */
 static uint16_t nt_index(uint16_t a)
 {
-    a &= 0xfff;
-    switch (mmc_ctrl & 3) {
-    case 0: return a & 0x3ff;
-    case 1: return 0x400 | (a & 0x3ff);
-    case 2: return a & 0x7ff;
-    default: return ((a >> 1) & 0x400) | (a & 0x3ff);
-    }
+    return (uint16_t)(nt_map[(a >> 10) & 3] | (a & 0x3ff));
 }
 
 static void mark(uint16_t i)
@@ -83,7 +105,13 @@ static void vram_write(uint8_t v)
     } else if (a >= 0x2000) {
         uint16_t i = nt_index(a);
         if (nes_vram[i] != v) { nes_vram[i] = v; mark(i); }
-    }                                           /* CHR is ROM: writes below $2000 are ignored */
+    } else if (nes_chr == nes_chr_ram) {        /* CHR RAM: remember which tiles changed for the display */
+        if (nes_chr_ram[a] != v) {
+            uint16_t t = a >> 4;
+            nes_chr_ram[a] = v;
+            if (!chr_dirty_flag[t]) { chr_dirty_flag[t] = 1; chr_dirty[chr_ndirty++] = t; }
+        }
+    }                                           /* CHR ROM: writes below $2000 are ignored */
     ppu_v += (ppu_ctrl & 4) ? 32 : 1;
 }
 
@@ -93,7 +121,7 @@ static uint8_t vram_read(void)
     uint8_t r = ppu_rdbuf, d;
     if (a < 0x2000) {
         uint16_t bank = (mmc_ctrl & 0x10) ? ((a < 0x1000) ? mmc_chr0 : mmc_chr1) : ((mmc_chr0 & 0x1e) | (a >> 12));
-        d = nes_chr[(uint32_t)(bank & 31) * 0x1000 + (a & 0xfff)];
+        d = nes_chr == nes_chr_ram ? nes_chr_ram[a] : nes_chr[(uint32_t)(bank & 31) * 0x1000 + (a & 0xfff)];
     } else d = nes_vram[nt_index(a)];
     if (a >= 0x3f00) { uint16_t p = a & 0x1f; if ((p & 0x13) == 0x10) p &= 0x0f; r = nes_pal[p]; }
     ppu_rdbuf = d;
@@ -129,7 +157,7 @@ uint8_t nes_read_s0(void)
     if (ppu_s0) {
         split_seen = 1;
         split_ctrl = ppu_ctrl; split_chr0 = mmc_chr0; split_chr1 = mmc_chr1; split_t = ppu_t; split_fx = ppu_fx;
-        split_line = nes_oam[0];
+        split_line = nes_oam[0]; split_ax = ax_reg;
     }
     ppu_vbl = 0; ppu_w = 0; ppu_s0 ^= 1;
     return r;
@@ -149,6 +177,7 @@ void nes_mmc_ctrl(uint8_t v)
     if ((v ^ mmc_ctrl) & 0x03) nes_redraw_all = 1;
     mmc_ctrl = v;
     map_prg();
+    set_mirroring();
     mmc_shift = 0x10;
 }
 
@@ -161,7 +190,7 @@ static void mmc1(uint16_t a, uint8_t v)
         if (done) {
             uint8_t val = mmc_shift;
             switch ((a >> 13) & 3) {
-            case 0: if ((val ^ mmc_ctrl) & 0x03) nes_redraw_all = 1; mmc_ctrl = val; break;   /* mirroring */
+            case 0: if ((val ^ mmc_ctrl) & 0x03) nes_redraw_all = 1; mmc_ctrl = val; set_mirroring(); break;   /* mirroring */
             case 1: mmc_chr0 = val; break;          /* tile sets: the display compares what it drew with */
             case 2: mmc_chr1 = val; break;
             default: mmc_prg = val; break;
@@ -207,5 +236,8 @@ void nes_write_slow(uint16_t a, uint8_t v)
         }
         return;
     }
-    if (a >= 0x8000) mmc1(a, v);                /* $4020-$7FFF: nothing there on this board */
+    if (a >= 0x8000) {                          /* $4020-$7FFF: nothing there on these boards */
+        if (nes_mapper == 7) { ax_reg = v; map_prg(); set_mirroring(); }   /* AxROM: one register, no bus conflicts modelled */
+        else mmc1(a, v);
+    }
 }

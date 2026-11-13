@@ -189,7 +189,10 @@ static void irq_nmi(uint16_t vec)
 static void step(void)
 {
     uint8_t op, m, lo, hi; uint16_t a = 0, pc0 = PC; int mode;
-    if (nmi_pending == 1) { nmi_pending = 0; irq_nmi(0xfffa); pc0 = PC; } else if (nmi_pending) nmi_pending--;   /* NMI one instruction after the flag rises */
+    if (nmi_pending == 1) { static int nl = -1; nmi_pending = 0;
+        if (nl < 0) nl = getenv("NMI_LOG") != 0;
+        if (nl) printf("NMI at %02x:%04x S=%02x\n", PC >= 0x8000 ? prg_bank_for(PC) : 0xff, PC, S);    /* NMI_LOG=1: where the NMI interrupts */
+        irq_nmi(0xfffa); pc0 = PC; } else if (nmi_pending) nmi_pending--;   /* NMI one instruction after the flag rises */
     if (cov) cov_mark(PC, 1);
     { static int lastbank = -1; int nb = PC >= 0x8000 ? prg_bank_for(PC) : -1;
       if (nb >= 0 && lastbank >= 0 && nb != lastbank) flow('B', pc0, PC);

@@ -3,6 +3,7 @@
  *   host_test N            print the checksum after N ticks
  *   host_test N -v         also print the checksum every 100 ticks (to find the first tick that differs)
  *   host_test N -r file    also write NES RAM after every tick to file (for tools/verify)
+ *   host_test N -s       print the bench input as a tools/nesref -i script
  *   host_test N -d t1,t2   also write the picture after these ticks as host_NNNNN.ppm (host_render.c)
  */
 #include <stdio.h>
@@ -17,7 +18,8 @@ uint8_t nes_prg_data[0x20000], nes_chr_data[0x20000];
 static void load(const char *name, uint8_t *dst)
 {
     FILE *f = fopen(name, "rb");
-    if (!f || fread(dst, 1, 0x20000, f) != 0x20000) { fprintf(stderr, "cannot read %s (run tools/make_assets.sh)\n", name); exit(2); }
+    if (!f) { fprintf(stderr, "cannot read %s (run tools/make_assets.sh)\n", name); exit(2); }
+    if (fread(dst, 1, 0x20000, f)) {}         /* the ROM's size (CHR may be empty: CHR RAM) */
     fclose(f);
 }
 
@@ -28,6 +30,15 @@ int main(int argc, char **argv)
     FILE *ramlog = (argc > 3 && !strcmp(argv[2], "-r")) ? fopen(argv[3], "wb") : 0;
     const char *dumps = (argc > 3 && !strcmp(argv[2], "-d")) ? argv[3] : 0;   /* -d 100,200,... : frames as PPM */
     char key[32], name[64];
+    if (argc > 2 && !strcmp(argv[2], "-s")) {        /* -s: the bench input as a tools/nesref -i script */
+        static const char *names[8] = { "RIGHT", "LEFT", "DOWN", "UP", "A", "B", "START", "SELECT" };
+        for (t = 0; t < n; t++) { unsigned short in = game_bench_input(t); int b;
+            if (!in) continue;
+            printf("%u %u", t, t);
+            for (b = 0; b < 8; b++) if (in & (1 << b)) printf(" %s", names[b]);
+            printf("\n"); }
+        return 0;
+    }
     load("assets/prg.bin", nes_prg_data);
     load("assets/chr.bin", nes_chr_data);
     game_init();
