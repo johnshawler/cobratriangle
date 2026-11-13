@@ -25,6 +25,10 @@
 #include "disp.h"
 #include "nes.h"
 #include "video.h"
+#ifndef __m68k__
+#include <stdio.h>
+#include <stdlib.h>
+#endif
 
 #define PLANES   4
 #define LEVEL_W  8192                   /* unwrapped world width: the camera is re-centred if it gets near an end */
@@ -119,45 +123,55 @@ static UWORD nt_cell(LONG uc, int r) { return (UWORD)(pf_page | (r << 5) | (uc &
 static UBYTE colstate[64];              /* by unwrapped column & 63: 1 drawn from the nametable, 2 drawn blank */
 static int col_visible(LONG uc) { LONG x = uc * 8; return x + 8 > cam_ux + ((mask_left & 2) ? 0 : 8) && x < cam_ux + 256; }
 
-/* rowcopies[r]: bit 0 = the copy at y = 8r is up to date, bit 1 = the copy at y = 8r + 240 */
-static UBYTE rowcopies[30];
+/* rowlines[r][c]: how many lines (from the top) of copy c of tile row r are up to date: the copy at y = 8r
+   (c = 0) or at y = 8r + 240 (c = 1). 8 = all; fewer when the status bar was blitted over its lower part. */
+static UBYTE rowlines[30][2];
 static UBYTE tused[256];                /* background tiles drawn since the last full redraw (CHR RAM changes) */
-static UBYTE row_need(int r, int sy)
+static int need_lines(int r, int c, int sy)
 {
-    int y0 = 8 * r, y1 = 8 * r + 240;
-    return (UBYTE)(((y0 + 8 > sy && y0 < sy + pf_h) ? 1 : 0) | ((y1 + 8 > sy && y1 < sy + pf_h) ? 2 : 0));
+    int yc = 8 * r + 240 * c, n = sy + pf_h - yc;
+    if (yc + 8 <= sy || n <= 0) return 0;
+    return n > 8 ? 8 : n;
 }
 
-static void blank8(UBYTE *d)
+/* lines f..t-1 of a tile, attribute planes only under its pixels (as tile8), or of a blank (border) tile */
+static void tile_part(UBYTE *d, const UBYTE *chr, ULONG attr, int f, int t)
 {
-    int i;
-    for (i = 0; i < 8; i++, d += 64) { d[0] = 0; d[video_plane] = 0; d[2 * video_plane] = 0xff; d[3 * video_plane] = 0; }
+    for (d += f * 64; f < t; f++, d += 64) {
+        UBYTE m = (UBYTE)(chr[f] | chr[f + 8]);
+        d[0] = chr[f]; d[video_plane] = chr[f + 8]; d[2 * video_plane] = (UBYTE)(attr & m); d[3 * video_plane] = (UBYTE)((attr >> 8) & m);
+    }
 }
+static const UBYTE blank_tile[16];
 
-static void draw_tile_copies(LONG uc, int r, UBYTE copies)
+/* draw lines f0..t0-1 of copy 0 and f1..t1-1 of copy 1 of the tile at column uc, row r */
+static void draw_rows(LONG uc, int r, int f0, int t0, int f1, int t1)
 {
     UWORD cell = nt_cell(uc, r);
     UBYTE tile = nes_vram[cell], tx = (UBYTE)(uc & 31);
     UBYTE attr = nes_vram[pf_page | 0x3c0 | ((r >> 2) << 3) | (tx >> 2)];
     UBYTE pal = (UBYTE)((attr >> (((r & 2) << 1) | (tx & 2))) & 3);
-    UBYTE p2 = (pal & 1) ? 0xff : 0, p3 = (pal & 2) ? 0xff : 0;
+    ULONG at = (ULONG)(((pal & 2) ? 0xff00 : 0) | ((pal & 1) ? 0xff : 0));
+    const UBYTE *chr;
     LONG x = uc * 8;
     UBYTE *d;
-    if (x < -64 || x >= LEVEL_W + 320 || !copies) return;
+    if (x < -64 || x >= LEVEL_W + 320 || (f0 >= t0 && f1 >= t1)) return;
 #ifdef LOGIC_TRACE
     { extern ULONG vtiles; vtiles++; }
 #endif
     d = disp_front + (ULONG)(r * 8) * 64 + ((x + disp_margin) >> 3);
-    if (colstate[uc & 63] == 2) {
-        if (copies & 1) blank8(d);
-        if (copies & 2) blank8(d + 240 * 64);
+    if (colstate[uc & 63] == 2) { chr = blank_tile; at = 0xff; }   /* border: colour 4 (blank_tile has no pixels: */
+    else { chr = bg_chr(tile); tused[tile] = 1; }                   /*  the mask below is forced for it)          */
+    if (chr == blank_tile) {
+        int i;
+        for (i = f0; i < t0; i++) { UBYTE *q = d + i * 64; q[0] = 0; q[video_plane] = 0; q[2 * video_plane] = 0xff; q[3 * video_plane] = 0; }
+        for (i = f1; i < t1; i++) { UBYTE *q = d + 240 * 64 + i * 64; q[0] = 0; q[video_plane] = 0; q[2 * video_plane] = 0xff; q[3 * video_plane] = 0; }
         return;
     }
-    tused[tile] = 1;
-    if (copies & 1) tile8(d, bg_chr(tile), (ULONG)(p3 << 8 | p2));
-    if (copies & 2) tile8(d + 240 * 64, bg_chr(tile), (ULONG)(p3 << 8 | p2));
+    if (f0 == 0 && t0 == 8) tile8(d, chr, at); else if (f0 < t0) tile_part(d, chr, at, f0, t0);
+    if (f1 == 0 && t1 == 8) tile8(d + 240 * 64, chr, at); else if (f1 < t1) tile_part(d + 240 * 64, chr, at, f1, t1);
 }
-static void draw_tile(LONG uc, int r) { draw_tile_copies(uc, r, rowcopies[r]); }
+static void draw_tile(LONG uc, int r) { draw_rows(uc, r, 0, rowlines[r][0], 0, rowlines[r][1]); }
 
 static void want_cols(LONG *lo, LONG *hi)
 {
@@ -167,18 +181,25 @@ static void want_cols(LONG *lo, LONG *hi)
 
 static void invalidate(void) { col_lo = 1; col_hi = 0; work_row = -1; memset(tused, 0, sizeof tused); }
 
-/* make every row's copies match what the scroll position sy shows */
+/* make every row's copies have the lines the scroll position sy shows */
 static void sync_rows(int sy)
 {
     int r;
     LONG uc;
     for (r = 0; r < 30; r++) {
-        UBYTE need = row_need(r, sy), missing = (UBYTE)(need & ~rowcopies[r]);
-        if (missing && col_lo <= col_hi) {
-            for (uc = col_lo; uc <= col_hi; uc++) draw_tile_copies(uc, r, missing);
-            if (work_row > r) draw_tile_copies(work_col, r, missing);
+        int n0 = need_lines(r, 0, sy), n1 = need_lines(r, 1, sy), h0 = rowlines[r][0], h1 = rowlines[r][1];
+        if (!n0) h0 = 0;                                /* not shown: forgotten (drawn again in full when needed) */
+        if (!n1) h1 = 0;
+        if ((n0 > h0 || n1 > h1) && col_lo <= col_hi) {
+            int f0 = h0, t0 = n0 > h0 ? n0 : h0, f1 = h1, t1 = n1 > h1 ? n1 : h1;
+            if (n0 <= h0) f0 = t0;
+            if (n1 <= h1) f1 = t1;
+            for (uc = col_lo; uc <= col_hi; uc++) draw_rows(uc, r, f0, t0, f1, t1);
+            if (work_row > r) draw_rows(work_col, r, f0, t0, f1, t1);
         }
-        rowcopies[r] = need;
+        if (n0 > h0) h0 = n0;
+        if (n1 > h1) h1 = n1;
+        rowlines[r][0] = (UBYTE)h0; rowlines[r][1] = (UBYTE)h1;
     }
 }
 
@@ -198,7 +219,7 @@ static void stream_cols(int n)
             work_row = 0;
             colstate[work_col & 63] = col_visible(work_col) ? 1 : 2;
         }
-        if (rowcopies[work_row]) { draw_tile(work_col, work_row); n--; }
+        if (rowlines[work_row][0] | rowlines[work_row][1]) { draw_tile(work_col, work_row); n--; }
         if (++work_row == 30) {
             if (work_col > col_hi) col_hi = work_col; else col_lo = work_col;
             work_row = -1;
@@ -207,11 +228,16 @@ static void stream_cols(int n)
 }
 
 /* columns that crossed the edge of the NES picture since they were drawn */
+static LONG edges_cam = -99999;
 static void fix_edges(void)
 {
-    LONG uc;
-    int r;
-    for (uc = col_lo; uc <= col_hi; uc++) {
+    LONG uc, lo = col_lo, hi = col_hi;
+    int r, step = 1;
+    /* a column's state only changes near the picture's edges, unless the camera jumped */
+    if (cam_ux - edges_cam < 8 && edges_cam - cam_ux < 8) step = 0;
+    edges_cam = cam_ux;
+    for (uc = lo; uc <= hi; uc++) {
+        if (!step && uc > (cam_ux + 16) >> 3 && uc < (cam_ux + 256 - 16) >> 3) { uc = ((cam_ux + 256 - 16) >> 3) - 1; continue; }
         UBYTE want = col_visible(uc) ? 1 : 2;
         if (colstate[uc & 63] != want) {
             colstate[uc & 63] = want;
@@ -376,8 +402,11 @@ static void bar_frame(int sy, int moved)
     blit_bar(cam_ux, y0, y1 - y0);
     bar_x = cam_ux; bar_y = sy; bar_h = pf_h;
     for (r = 0; r < 30; r++) {                          /* the row copies the bar covered must be drawn again */
-        if (8 * r + 8 > y0 && 8 * r < y1) rowcopies[r] &= (UBYTE)~1;
-        if (8 * r + 248 > y0 && 8 * r + 240 < y1) rowcopies[r] &= (UBYTE)~2;
+        int c;
+        for (c = 0; c < 2; c++) {                       /* lines below y0 of a row copy are the bar's now */
+            int yc = 8 * r + 240 * c;
+            if (yc + 8 > y0 && yc < y1 && rowlines[r][c] > (y0 > yc ? y0 - yc : 0)) rowlines[r][c] = (UBYTE)(y0 > yc ? y0 - yc : 0);
+        }
     }
 }
 
@@ -462,20 +491,26 @@ static void build_groups(void)
                 || save[m].n != grp[m].n || save[m].pals != grp[m].pals || memcmp(save[m].idx, grp[m].idx, save[m].n)) { vprof[11]++; break; }
     }
 #endif
-    for (i = 0; i < ngrp; i++)                          /* merge groups that touch and share a palette, while they fit */
+    for (i = 0; i < ngrp; i++) {                        /* merge groups that touch, while they fit */
+        Group *a = &grp[i];
+        WORD ax0, ax1, ay0, ay1;
+        if (!a->n) continue;
+        ax0 = a->x0; ax1 = a->x1; ay0 = a->y0; ay1 = a->y1;
         for (j = i + 1; j < ngrp && j <= i + 6; j++) {
-            Group *a = &grp[i], *b = &grp[j];
-            WORD nx0 = a->x0 < b->x0 ? a->x0 : b->x0, nx1 = a->x1 > b->x1 ? a->x1 : b->x1;
-            if (!a->n || !b->n || nx1 - nx0 > SPR_W || a->n + b->n > MAXIN) continue;
-            if (b->y0 > a->y1 + 1 || b->y1 < a->y0 - 1 || b->x0 > a->x1 + 1 || b->x1 < a->x0 - 1) continue;
-            a->x0 = nx0; a->x1 = nx1;
-            if (b->y0 < a->y0) a->y0 = b->y0;
-            if (b->y1 > a->y1) a->y1 = b->y1;
+            Group *b = &grp[j];
+            WORD nx0, nx1;
+            if (b->y0 > ay1 + 1 || b->y1 < ay0 - 1 || b->x0 > ax1 + 1 || b->x1 < ax0 - 1 || !b->n) continue;
+            nx0 = ax0 < b->x0 ? ax0 : b->x0; nx1 = ax1 > b->x1 ? ax1 : b->x1;
+            if (nx1 - nx0 > SPR_W || a->n + b->n > MAXIN) continue;
+            a->x0 = ax0 = nx0; a->x1 = ax1 = nx1;
+            if (b->y0 < ay0) a->y0 = ay0 = b->y0;
+            if (b->y1 > ay1) a->y1 = ay1 = b->y1;
             for (k = 0; k < b->n; k++) a->idx[a->n++] = b->idx[k];
             a->pals |= b->pals;
             b->n = 0;                                   /* merged away: skipped from here on */
             b->y0 = 0x7fff;
         }
+    }
     for (i = j = 0; i < ngrp; i++)                      /* drop the merged-away groups (only the used part moves) */
         if (grp[i].n) {
             if (i != j) { Group *a = &grp[j], *b = &grp[i];
@@ -486,16 +521,15 @@ static void build_groups(void)
     ngrp = j;
 }
 
-static int fits(int n, Group *g)
-{
-    return hn[n] < NSEG && (!hn[n] || hseg[n][hn[n] - 1]->y1 + 1 <= g->y0);
-}
+static WORD busy[8];                    /* first free line of each hardware sprite below its last segment */
+#define fits(n, g) (busy[n] <= (g)->y0 && hn[n] < NSEG)
+#define place(n, g) (hseg[n][hn[n]++] = (g), busy[n] = (WORD)((g)->y1 + 1))
 
 static void assign(void)
 {
     int i, j, k, n;
     Group *order[64];
-    for (i = 0; i < 7; i++) hn[i] = 0;
+    for (i = 0; i < 7; i++) { hn[i] = 0; busy[i] = -32767; }
     for (i = 0; i < ngrp; i++) order[i] = &grp[i];
     for (i = 1; i < ngrp; i++) {                      /* by top line */
         Group *t = order[i];
@@ -508,12 +542,12 @@ static void assign(void)
         if (!(g->pals & (g->pals - 1))) {               /* one palette: a sprite of its own colours */
             int p = g->pals == 1 ? 0 : g->pals == 2 ? 1 : g->pals == 4 ? 2 : 3;
             for (n = 2 * p; n <= 2 * p + 1 && n <= 6; n++)
-                if (fits(n, g)) { hseg[n][hn[n]++] = g; g->se = (BYTE)n; break; }
+                if (fits(n, g)) { place(n, g); g->se = (BYTE)n; break; }
             if (g->se >= 0) continue;
         }
         for (k = 0; k < 3; k++)
             if (fits(2 * k, g) && fits(2 * k + 1, g)) {
-                hseg[2 * k][hn[2 * k]++] = g; hseg[2 * k + 1][hn[2 * k + 1]++] = g;
+                place(2 * k, g); place(2 * k + 1, g);
                 g->se = (BYTE)(2 * k); g->so = (BYTE)(2 * k + 1);
                 break;
             }
@@ -655,7 +689,7 @@ static void build_sprites(void)
             ULONG key = sig ^ (ULONG)n ^ (o ? 0x80000000UL : 0);
             ULONG *ke = &slot_key[spr_set][g->se][g->ie];
             VP(10, {
-            if (NOSKIP || *ke != key || slot_off[spr_set][g->se][g->ie] != g->oe) copy_lines(e + 16, ae, n);
+            if (NOSKIP || *ke != key || slot_off[spr_set][g->se][g->ie] != g->oe) { copy_lines(e + 16, ae, n); vstat[3]++; }
             *ke = key; slot_off[spr_set][g->se][g->ie] = g->oe;
             if (o) {
                 ULONG *ko = &slot_key[spr_set][g->so][g->io];
@@ -668,6 +702,7 @@ static void build_sprites(void)
 
 /* ---------------------------------------------------------------- frame */
 static ULONG pal_rgb[32];
+static int pal_loaded;
 static UBYTE spr_valid, was_on, last_pal0;
 
 static void set_palette(int on, UBYTE pal0)
@@ -675,10 +710,12 @@ static void set_palette(int on, UBYTE pal0)
     int i;
     for (i = 0; i < 32; i++) {
         UBYTE c = (i & 3) ? nes_pal[i] : nes_pal[0];   /* 4, 8, 12: the backdrop below the split (the bar's colour 0) */
+        ULONG rgb;
         if (i == 0) c = pal0;
-        pal_rgb[i] = on ? nes_rgb[c & 0x3f] : 0;
+        rgb = on ? nes_rgb[c & 0x3f] : 0;
+        if (rgb != pal_rgb[i] || !pal_loaded) { pal_rgb[i] = rgb; disp_palette(&pal_rgb[i], (UWORD)i, 1); }   /* only what changed */
     }
-    disp_palette(pal_rgb, 0, 32);
+    pal_loaded = 1;
 }
 
 int video_load(void)
@@ -802,4 +839,13 @@ void video_frame(void)
     /* the status bar last: its blits run on while the CPU goes on with the next ticks in fast RAM */
     if (split && on) VP(5, bar_frame(sy, bar_dirty));
     else bar_x = -1;
+#ifndef __m68k__
+    {   int r, c; extern int vhost_frame;                /* host check: every shown row copy has its lines */
+        for (r = 0; r < 30; r++) for (c = 0; c < 2; c++) {
+            int yc = 8 * r + 240 * c, n = need_lines(r, c, sy);
+
+            if (on && col_lo <= col_hi && rowlines[r][c] < n && getenv("VCHECK"))
+                fprintf(stderr, "frame %d row %d copy %d lines %d need %d sy %d\n", vhost_frame, r, c, rowlines[r][c], n, sy);
+        } }
+#endif
 }

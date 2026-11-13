@@ -14,6 +14,7 @@
 
 uint8_t nes_prg_data[0x20000], nes_chr_data[0x20000];
 UWORD disp_row, disp_margin; ULONG disp_plane; UBYTE *disp_front, *disp_back, *disp_clean;
+int vhost_frame;
 static DispCfg cfg; static LONG scx, scy; static ULONG pal[256];
 static UWORD *spr[8];
 void *sys_alloc(ULONG size, ULONG f) { (void)f; return calloc(1, size); }
@@ -91,11 +92,11 @@ int main(int argc, char **argv)
     for (t = 0; t < n; t++) {
         game_tick(game_bench_input(t));
         if (getenv("EVERY") && t % atoi(getenv("EVERY")) && !strstr(list, key0(t + 1))) continue;   /* draw only every Nth tick, like a slow Amiga */
-        video_frame();
+        vhost_frame = (int)t + 1; video_frame();
         snprintf(key, sizeof key, ",%u,", t + 1);
         if (strstr(list, key)) { snprintf(name, sizeof name, "vhost_%05u.ppm", t + 1); shot(name); }
     }
-    { extern ULONG vstat[4]; printf("groups %lu cache hits %lu NES sprites drawn %lu (all frames)\n", vstat[0], vstat[1], vstat[2]); }
+    { extern ULONG vstat[4]; printf("groups %lu cache hits %lu NES sprites drawn %lu even-list copies %lu (all frames)\n", vstat[0], vstat[1], vstat[2], vstat[3]); }
     printf("sprite clusters dropped: %d\n", video_sprites_dropped);
     return 0;
 }

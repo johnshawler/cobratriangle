@@ -42,7 +42,7 @@ static int game_load(void)
 /* debug: a sampling profiler. At every vertical blank, find the interrupted program counter in the exception
    frame (SR with the supervisor byte clear, PC, format word $006C for the level 3 vector) and keep it. */
 ULONG prof_pc[16384], prof_n;
-ULONG frame_log[16384], frame_n;          /* debug: vertical blank and tick at every drawn frame */
+ULONG frame_log[16384], frame_n, frame_vt[8192];          /* debug: vertical blank and tick at every drawn frame */
 static void prof_hook(void)
 {
     UWORD *w;
@@ -83,7 +83,8 @@ static void game_draw(void)
     disp_begin();
 #ifdef LOGIC_TRACE
     {   extern uint32_t video_time_sum, video_time_max, video_calls; ULONG t0 = sys_now(), dt;
-        video_frame(); dt = sys_now() - t0; if (logic_frames >= 2000 && logic_frames < 2500) { video_time_sum += dt; video_calls++; } if (dt > video_time_max) video_time_max = dt; }
+        video_frame(); dt = sys_now() - t0;
+        { extern ULONG frame_vt[], frame_n; if (frame_n < 8192) frame_vt[frame_n] = dt; } if (logic_frames >= 2000 && logic_frames < 2500) { video_time_sum += dt; video_calls++; } if (dt > video_time_max) video_time_max = dt; }
 #else
     video_frame();
 #endif
@@ -159,6 +160,7 @@ int main(int argc, char **argv)
             {   extern void *reset_fn; extern ULONG prof_buf[], prof_cnt; ULONG base = (ULONG)reset_fn; fh = Open((CONST_STRPTR)"prof.bin", MODE_NEWFILE);
                 ULONG cbase = (ULONG)game_tick; if (fh) { Write(fh, &base, 4); Write(fh, &cbase, 4); Write(fh, prof_buf, prof_cnt * 4); Close(fh); } }
             {   fh = Open((CONST_STRPTR)"frames.bin", MODE_NEWFILE); if (fh) { Write(fh, frame_log, frame_n * 8); Close(fh); } }
+            {   fh = Open((CONST_STRPTR)"framevt.bin", MODE_NEWFILE); if (fh) { Write(fh, frame_vt, frame_n * 4); Close(fh); } }
             {   extern uint32_t logic_time[]; fh = Open((CONST_STRPTR)"ticktime.bin", MODE_NEWFILE);
                 if (fh) { Write(fh, logic_time, logic_ntrace * 4); Close(fh); } }
         }

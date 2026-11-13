@@ -226,9 +226,13 @@ def generate(g):
         if mode == 'izy':
             if AX:                              # the pointer is nearly always into ROM: read it here (a3 = $8000)
                 st = newstub()
-                return ['moveq #0,d7', 'move.w %d(a5),d7' % (arg - 0x80), 'rol.w #8,d7', 'movea.l d7,a0', 'adda.l d2,a0',
-                        'cmpa.l #$8000,a0', 'bcs.s %sa' % st, 'move.b (-$8000,a3,a0.l),d4', 'bra.s %sb' % st,
-                        '%sa:' % st, 'bsr _rd_ea', '%sb:' % st], 'd4', True
+                slow = ['moveq #0,d7', 'move.w %d(a5),d7' % (arg - 0x80), 'rol.w #8,d7', 'movea.l d7,a0', 'adda.l d2,a0', 'bsr _rd_ea']
+                if ptrc['zp'] == arg:           # a6 = where ($zp) points in the mapped ROM, or 0 (not ROM)
+                    return ['move.l a6,d7', 'beq.s %sa' % st, 'move.b (a6,d2.w),d4', 'bra.s %sb' % st, '%sa:' % st] + slow + ['%sb:' % st], 'd4', True
+                ptrc['zp'] = arg
+                return ['moveq #0,d7', 'move.w %d(a5),d7' % (arg - 0x80), 'rol.w #8,d7', 'movea.l d7,a0',
+                        'cmpa.l #$8000,a0', 'bcs.s %sa' % st, 'lea (-$8000,a3,a0.l),a6', 'move.b (a6,d2.w),d4', 'bra.s %sb' % st,
+                        '%sa:' % st, 'suba.l a6,a6', 'adda.l d2,a0', 'bsr _rd_ea', '%sb:' % st], 'd4', True
             return ['moveq #0,d7', 'move.w %d(a5),d7' % (arg - 0x80), 'rol.w #8,d7', 'movea.l d7,a0', 'adda.l d2,a0', 'bsr _rd_ea'], 'd4', True
         if mode == 'izx':
             return ['lea %d(a5,d1.w),a0' % (arg - 0x80), 'moveq #0,d7', 'move.w (a0),d7', 'rol.w #8,d7', 'movea.l d7,a0', 'bsr _rd_ea'], 'd4', True
@@ -257,6 +261,7 @@ def generate(g):
     LEAN = {0x2000, 0x2001, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007}
     lean_used = set()
     icn = [0]
+    ptrc = {'zp': None}                     # the (zp),Y pointer whose ROM address a6 holds, in this basic block
     stubcount = [0]
     def newstub():
         stubcount[0] += 1
@@ -292,6 +297,7 @@ def generate(g):
             E('    bra .L%04x' % resume)
         elif addrs and addrs[0] != e: E('    bra .L%04x' % e)
         nzsrc = None; c68 = None; known_c = None; fuse = None
+        ptrc['zp'] = None
         # waits
         waits = {}
         for a in addrs:
@@ -317,6 +323,13 @@ def generate(g):
             if a in labels:
                 E('.L%04x:' % a)
                 nzsrc = None; c68 = None; known_c = None; fuse = None
+                ptrc['zp'] = None
+            if d and ptrc['zp'] is not None:    # anything that may change the pointer, a3 or a6 ends the cache
+                m0, mode0, arg0, _ = d
+                if m0 in ('JSR', 'RTS', 'RTI', 'BRK', 'JMP') or mapper_write(d): ptrc['zp'] = None
+                elif m0 in ('STA', 'STX', 'STY', 'INC', 'DEC', 'ASL', 'LSR', 'ROL', 'ROR') and mode0 not in ('acc', 'imp'):
+                    if mode0 in ('zpx', 'zpy', 'izx', 'izy') or (mode0 in ('zp', 'abs') and arg0 in (ptrc['zp'], (ptrc['zp'] + 1) & 0xff)) \
+                       or (mode0 in ('abx', 'aby') and arg0 < 0x100): ptrc['zp'] = None
             if not d:
                 E('    move.w #$%04x,d7' % a); E('    bra _fatal_op'); continue
             m, mode, arg, n = d
