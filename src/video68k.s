@@ -1,5 +1,8 @@
 ; video68k.s - the two inner loops of src/video.c, in assembly (they run every frame and stay in the cache).
         section code,code
+SPRW    equ     32                      ; = SPR_W in src/video.c
+SPRLB   equ     SPRW/4                  ; bytes a sprite line (two planes)
+SPRHB   equ     SPRW/8
         xdef    _tile8,_spr_put
         xref    _video_plane,_video_flip
 
@@ -74,20 +77,20 @@ _spr_put:
         not.w   d0                      ; keep mask
         and.w   d0,(a0)
         or.w    d1,(a0)
-        and.w   d0,8(a0)
-        or.w    d2,8(a0)
+        and.w   d0,SPRHB(a0)
+        or.w    d2,SPRHB(a0)
         btst    #12,d7
         beq.s   .next
         and.w   d0,(a1)
         btst    #10,d7
         beq.s   .p2
         or.w    d3,(a1)
-.p2     and.w   d0,8(a1)
+.p2     and.w   d0,SPRHB(a1)
         btst    #11,d7
         beq.s   .next
-        or.w    d3,8(a1)
-.next   lea     16(a0),a0
-        lea     16(a1),a1
+        or.w    d3,SPRHB(a1)
+.next   lea     SPRLB(a0),a0
+        lea     SPRLB(a1),a1
         adda.w  d4,a2
         dbf     d5,.row
         movem.l (sp)+,d2-d7/a3
@@ -144,7 +147,7 @@ _group_scan:
         bgt.s   .m1
         move.w  d3,d0
 .m1     sub.w   a4,d0                   ; nx1 - nx0
-        cmp.w   #64,d0
+        cmp.w   #SPRW,d0
         bgt     .nofit
         cmp.w   #MAXIN,d6
         bcc     .nofit
@@ -219,7 +222,7 @@ _group_scan:
         move.w  2(a4),d5
 .o1     move.w  d5,d6
         sub.w   d4,d6
-        cmp.w   #64,d6
+        cmp.w   #SPRW,d6
         bgt.s   .onext
         cmp.b   #MAXIN,8(a4)
         bcc.s   .onext

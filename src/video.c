@@ -33,7 +33,9 @@
 #define PLANES   4
 #define LEVEL_W  8192                   /* unwrapped world width: the camera is re-centred if it gets near an end */
 #define VIEW_X   32                     /* the 256-pixel NES picture starts 32 pixels into the 320-pixel view */
-#define SPR_W    64
+#define SPR_W    32                     /* hardware sprite width: lines of SPR_LB bytes (two planes) */
+#define SPR_LB   (SPR_W / 4)
+#define SPR_HB   (SPR_W / 8)
 #define BUF_H    480                    /* every tile row twice: y and y + 240 */
 
 /* The status bar, as Cobra Triangle times it (tools/nesref trace of a play frame): sprite-0 hit at line 180,
@@ -92,15 +94,15 @@ static void spr_put(UBYTE *e, UBYTE *o, const UBYTE *chr, ULONG ctl)
 {
     int dx = ctl & 63, sh = 8 - (dx & 7), r;
     e += dx >> 3; o += dx >> 3;
-    for (r = 0; r < 8; r++, e += 16, o += 16) {
+    for (r = 0; r < 8; r++, e += SPR_LB, o += SPR_LB) {
         int row = (ctl & 0x200) ? 7 - r : r;
         UBYTE p0 = chr[row], p1 = chr[row + 8];
         UWORD m, k;
         if (ctl & 0x100) { p0 = video_flip[p0]; p1 = video_flip[p1]; }
         if (!(p0 | p1)) continue;
         m = (UWORD)((p0 | p1) << sh); k = (UWORD)~m;
-        PUTW(e, (GETW(e) & k) | (p0 << sh)); PUTW(e + 8, (GETW(e + 8) & k) | (p1 << sh));
-        if (ctl & 0x1000) { PUTW(o, (GETW(o) & k) | ((ctl & 0x400) ? m : 0)); PUTW(o + 8, (GETW(o + 8) & k) | ((ctl & 0x800) ? m : 0)); }
+        PUTW(e, (GETW(e) & k) | (p0 << sh)); PUTW(e + SPR_HB, (GETW(e + SPR_HB) & k) | (p1 << sh));
+        if (ctl & 0x1000) { PUTW(o, (GETW(o) & k) | ((ctl & 0x400) ? m : 0)); PUTW(o + SPR_HB, (GETW(o + SPR_HB) & k) | ((ctl & 0x800) ? m : 0)); }
     }
 }
 #endif
@@ -424,7 +426,7 @@ static Group grp[64];
 static int ngrp;
 static Group *hseg[8][NSEG];            /* the clusters of each hardware sprite, top to bottom */
 static int hn[8];
-#define SPR_BYTES (16 * (240 + 2 * NSEG + 4))
+#define SPR_BYTES (SPR_LB * (240 + 2 * NSEG + 4))
 static UBYTE *spr_mem[2][8];            /* two sets of sprite lists, swapped every frame */
 static int spr_set;
 int video_sprites_dropped;
@@ -566,7 +568,7 @@ static void render_group(Group *g, UBYTE *e, UBYTE *o)
         int i = g->idx[k];
         UBYTE tile = nes_oam[i * 4 + 1], at = nes_oam[i * 4 + 2];
         int dx = nes_oam[i * 4 + 3] - g->x0, dy = nes_oam[i * 4] + 1 - g->y0;
-        spr_put(e + dy * 16, o ? o + dy * 16 : e, spr_chr(tile),
+        spr_put(e + dy * SPR_LB, o ? o + dy * SPR_LB : e, spr_chr(tile),
                 (ULONG)(dx | ((at & 0x40) << 2) | ((at & 0x80) << 2) | ((at & 3) << 10) | (o ? 0x1000 : 0)));
     }
 }
@@ -574,7 +576,7 @@ static void render_group(Group *g, UBYTE *e, UBYTE *o)
 static void clear_lines(UBYTE *p, int n)
 {
     ULONG *l = (ULONG *)p;
-    for (n >>= 4; n; n--) { l[0] = 0; l[1] = 0; l[2] = 0; l[3] = 0; l += 4; }
+    for (n >>= 3; n; n--) { l[0] = 0; l[1] = 0; l += 2; }
 }
 
 /* Rendered clusters are kept in a pool (fast RAM if there is any), found again by a signature of their content:
@@ -584,7 +586,7 @@ static void clear_lines(UBYTE *p, int n)
 #define NOSKIP 0
 #endif
 #define PC_LINES 64                     /* taller clusters are drawn every time */
-#define PC_BYTES (16 * PC_LINES)
+#define PC_BYTES (SPR_LB * PC_LINES)
 typedef struct { ULONG sig, last; UWORD n; UBYTE *e, *o; } PEnt;
 static PEnt *pc;
 static int pcn;                         /* entries: a power of two */
@@ -634,7 +636,7 @@ static PEnt *pool_find(ULONG sig, UWORD n, int *hit)
 static void copy_lines(UBYTE *d, const UBYTE *s, int n)
 {
     ULONG *l = (ULONG *)d; const ULONG *m = (const ULONG *)s;
-    for (n >>= 4; n; n--) { l[0] = m[0]; l[1] = m[1]; l[2] = m[2]; l[3] = m[3]; l += 4; m += 4; }
+    for (n >>= 3; n; n--) { l[0] = m[0]; l[1] = m[1]; l += 2; m += 2; }
 }
 
 static void put_ctl(UWORD n, UBYTE *d, Group *g, int att)
@@ -643,7 +645,7 @@ static void put_ctl(UWORD n, UBYTE *d, Group *g, int att)
     UWORD hs = (UWORD)(x + 0x80), vs = (UWORD)(y + 0x34), ve = (UWORD)(vs + h);
     if (d == spr_mem[spr_set][n]) { disp_sprite(n, (UWORD *)d, x, y, (UWORD)h, (UWORD)att); return; }   /* the first: the kit */
     PUTW(d, ((vs & 0xff) << 8) | ((hs >> 1) & 0xff));
-    PUTW(d + 8, ((ve & 0xff) << 8) | (att ? 0x80 : 0) | (((vs >> 8) & 1) << 2) | (((ve >> 8) & 1) << 1) | (hs & 1));
+    PUTW(d + SPR_HB, ((ve & 0xff) << 8) | (att ? 0x80 : 0) | (((vs >> 8) & 1) << 2) | (((ve >> 8) & 1) << 1) | (hs & 1));
 }
 
 static void build_sprites(void)
@@ -657,10 +659,10 @@ static void build_sprites(void)
         for (s = 0; s < hn[k]; s++) {
             Group *g = hseg[k][s];
             if (g->se == k) { g->oe = off; g->ie = (UBYTE)s; } else { g->oo = off; g->io = (UBYTE)s; }
-            off = (UWORD)(off + 16 + (g->y1 - g->y0) * 16);
+            off = (UWORD)(off + SPR_LB + (g->y1 - g->y0) * SPR_LB);
         }
         if (!hn[k]) disp_sprite_off((UWORD)k);
-        else memset(spr_mem[spr_set][k] + off, 0, 16);  /* end of the list */
+        else memset(spr_mem[spr_set][k] + off, 0, SPR_LB);  /* end of the list */
         for (s = hn[k]; s < NSEG; s++) slot_key[spr_set][k][s] = 0;   /* slots beyond the list: overwritten or stale */
     }
     vframe++;
@@ -672,7 +674,7 @@ static void build_sprites(void)
         int hit;
         bar_pump();
         if (g->se < 0) continue;
-        n = (g->y1 - g->y0) * 16;
+        n = (g->y1 - g->y0) * SPR_LB;
         e = spr_mem[spr_set][g->se] + g->oe;
         o = g->so >= 0 ? spr_mem[spr_set][g->so] + g->oo : 0;
         VP(8, {
@@ -691,11 +693,11 @@ static void build_sprites(void)
             ULONG key = sig ^ (ULONG)n ^ (o ? 0x80000000UL : 0);
             ULONG *ke = &slot_key[spr_set][g->se][g->ie];
             VP(10, {
-            if (NOSKIP || *ke != key || slot_off[spr_set][g->se][g->ie] != g->oe) { copy_lines(e + 16, ae, n); vstat[3]++; }
+            if (NOSKIP || *ke != key || slot_off[spr_set][g->se][g->ie] != g->oe) { copy_lines(e + SPR_LB, ae, n); vstat[3]++; }
             *ke = key; slot_off[spr_set][g->se][g->ie] = g->oe;
             if (o) {
                 ULONG *ko = &slot_key[spr_set][g->so][g->io];
-                if (NOSKIP || *ko != key || slot_off[spr_set][g->so][g->io] != g->oo) copy_lines(o + 16, ao, n);
+                if (NOSKIP || *ko != key || slot_off[spr_set][g->so][g->io] != g->oo) copy_lines(o + SPR_LB, ao, n);
                 *ko = key; slot_off[spr_set][g->so][g->io] = g->oo;
             } });
         }
@@ -788,7 +790,7 @@ void video_frame(void)
     }
 
     /* CHR RAM tiles the game rewrote */
-    VP(4, for (i = 0; i < chr_ndirty; i++) {
+    VPO(4, for (i = 0; i < chr_ndirty; i++) {
         UWORD tl = chr_dirty[i];
         chr_dirty_flag[tl] = 0;
         if ((tl >> 8) == bgsel) {
@@ -801,7 +803,7 @@ void video_frame(void)
     });
     chr_ndirty = 0;
 
-    VP(1, sync_rows(sy));
+    VPO(1, sync_rows(sy));
 
     /* nametable cells the game wrote (a whole new screen: draw it again column by column) */
     if (nes_ndirty > 200) { invalidate(); bar_valid = 0; }
@@ -817,9 +819,9 @@ void video_frame(void)
     /* while the visible part is incomplete (a new screen), show black and draw quickly */
     want_cols(&vlo, &vhi);
     budget = (on && col_lo <= vlo && col_hi >= vhi) ? 24 : 120;
-    VP(1, stream_cols(budget));
+    VPO(8, stream_cols(budget));
     if (!(col_lo <= vlo && col_hi >= vhi)) on = 0;
-    VP(6, if (col_lo <= col_hi) fix_edges());
+    VPO(6, if (col_lo <= col_hi) fix_edges());
 
     if (nes_pal_dirty || on != was_on || pal0 != last_pal0) { set_palette(on, pal0); nes_pal_dirty = 0; was_on = (UBYTE)on; last_pal0 = pal0; }
     disp_scroll(cam_ux - VIEW_X, sy);
@@ -832,14 +834,14 @@ void video_frame(void)
         st[0] = ppu_ctrl; st[1] = (UBYTE)split; st[2] = (UBYTE)pf_h; st[3] = 0;
         for (i = 0; i < 64; i++) if (last_oam[i] != oam4[i]) { same = 0; break; }
         if (!spr_valid || spr_chr_dirty || !same || memcmp(last_state, st, 4)) {
-            VP(2, build_sprites());
+            VPO(2, build_sprites());
             for (i = 0; i < 64; i++) last_oam[i] = oam4[i];
             memcpy(last_state, st, 4); spr_valid = 1;
         }
     }
     else { for (i = 0; i < 7; i++) disp_sprite_off((UWORD)i); spr_valid = 0; }
     /* the status bar last: its blits run on while the CPU goes on with the next ticks in fast RAM */
-    if (split && on) VP(5, bar_frame(sy, bar_dirty));
+    if (split && on) VPO(5, bar_frame(sy, bar_dirty));
     else bar_x = -1;
 #ifndef __m68k__
     {   int r, c; extern int vhost_frame;                /* host check: every shown row copy has its lines */

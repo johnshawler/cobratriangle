@@ -10,7 +10,11 @@ import sys, struct, subprocess, bisect, collections, os, glob
 d = sys.argv[1]
 lo, hi = (int(sys.argv[2]), int(sys.argv[3])) if len(sys.argv) > 3 else (0, 1 << 30)
 raw = open(os.path.join(d, 'prof.bin'), 'rb').read()
-base, cbase = struct.unpack('>II', raw[:8]); pcs = struct.unpack('>%dI' % ((len(raw) - 8) // 4), raw[8:])
+if raw[:4] == b'PRO3':                  # reset function, game_tick, tile8 (the display's assembly hunk)
+    base, cbase, vbase = struct.unpack('>III', raw[4:16]); raw = raw[16:]
+else:
+    base, cbase = struct.unpack('>II', raw[:8]); vbase = None; raw = raw[8:]
+pcs = struct.unpack('>%dI' % (len(raw) // 4), raw)
 exe = glob.glob(os.path.join(d, '*_dbg'))[0]
 def nm(args):
     out = subprocess.run(['docker', 'run', '--rm', '-v', os.getcwd() + ':/work', '-w', '/work', 'amigadev/crosstools:m68k-amigaos',
@@ -29,6 +33,9 @@ ref = [n for a, n in gen if n.startswith('F')]
 # the reset function's runtime address is base; its symbol is the one _reset_fn points at
 rsym = subprocess.run(['grep', '-m1', '_reset_fn:', 'src/gen68k.s'], capture_output=True, text=True).stdout.split()[-1]
 gbase = base - goff[rsym]
+vid = nm('vasmm68k_mot -quiet -Fhunk -m68020 -I. -Isrc -o /tmp/v.o src/video68k.s && m68k-amigaos-nm /tmp/v.o') if vbase else []
+voff = dict((n, a) for a, n in vid)
+vaddr = [a + vbase - voff.get('_tile8', 0) for a, n in vid] if vbase else []; vname = [n for a, n in vid]
 cmap = dict((n, a) for a, n in cs)
 cb = cbase - cmap.get('_game_tick', 0)
 gaddr = [a + gbase for a, n in gen]; gname = [n for a, n in gen]
@@ -47,6 +54,9 @@ for i, pc in enumerate(pcs):
     n += 1
     j = bisect.bisect_right(gaddr, pc) - 1
     if j >= 0 and pc - gaddr[j] < 0x4000 and gname[j] and pc < gaddr[-1] + 0x2000: cnt['gen ' + gname[j]] += 1; continue
+    if vaddr:
+        j = bisect.bisect_right(vaddr, pc) - 1
+        if j >= 0 and pc - vaddr[j] < 0x1000: cnt['asm ' + vname[j]] += 1; continue
     j = bisect.bisect_right(caddr, pc) - 1
     cnt['C ' + (cname[j] if j >= 0 else '?')] += 1
 print('samples', n)

@@ -30,7 +30,7 @@ void disp_sprite(UWORD n, UWORD *d, WORD x, WORD y, UWORD h, UWORD a)
     spr[n] = d;
     {   UWORD p = (UWORD)(((vs & 0xff) << 8) | ((hs >> 1) & 0xff));
         UWORD c = (UWORD)(((ve & 0xff) << 8) | (a ? 0x80 : 0) | (((vs >> 8) & 1) << 2) | (((ve >> 8) & 1) << 1) | (hs & 1));
-        UBYTE *b = (UBYTE *)d; b[0] = p >> 8; b[1] = (UBYTE)p; b[8] = c >> 8; b[9] = (UBYTE)c; }   /* big-endian, as on the Amiga */
+        UBYTE *b = (UBYTE *)d; int hb = cfg.sprite_w / 8; b[0] = p >> 8; b[1] = (UBYTE)p; b[hb] = c >> 8; b[hb + 1] = (UBYTE)c; }   /* big-endian, as on the Amiga */
 }
 void disp_sprite_off(UWORD n) { spr[n] = 0; }
 void blit_wait(void) { }
@@ -43,36 +43,37 @@ static void shot(const char *name)
         for (p = 0; p < 4; p++) c |= ((disp_front[off + p * disp_plane] >> b) & 1) << p;
         img[y][x] = pal[c];
     }
+    int W = cfg.sprite_w, LB = W / 4, HB = W / 8;
     for (n = 6; n >= 0; n--) {              /* walk each sprite list: segments of (pos, ctl, lines); lower numbers on top */
         UBYTE *d = (UBYTE *)spr[n];
         if (!d) continue;
         for (;;) {
             UWORD pos, ctl; int vs, ve, hs, l; UBYTE *o = 0;
             if (d - (UBYTE *)spr[n] > 4600) { fprintf(stderr, "sprite %d list runs past its block\n", n); break; }
-            pos = (UWORD)(d[0] << 8 | d[1]); ctl = (UWORD)(d[8] << 8 | d[9]);
+            pos = (UWORD)(d[0] << 8 | d[1]); ctl = (UWORD)(d[HB] << 8 | d[HB + 1]);
             vs = pos >> 8; ve = ctl >> 8; hs = ((pos & 0xff) << 1) | (ctl & 1);
             if (!pos && !ctl) break;
             vs |= (ctl & 4) << 6; ve |= (ctl & 2) << 7;
             if (ve <= vs) { fprintf(stderr, "sprite %d: bad segment vs %d ve %d\n", n, vs, ve); break; }
-            if ((n & 1) && (ctl & 0x80)) { d += 16 + (ve - vs) * 16; continue; }    /* drawn with its even sprite */
+            if ((n & 1) && (ctl & 0x80)) { d += LB + (ve - vs) * LB; continue; }    /* drawn with its even sprite */
             if (!(n & 1) && spr[n + 1]) {           /* an attached odd segment at the same place? */
                 UBYTE *q = (UBYTE *)spr[n + 1];
                 for (;;) {
-                    UWORD p2 = (UWORD)(q[0] << 8 | q[1]), c2 = (UWORD)(q[8] << 8 | q[9]); int v2 = p2 >> 8, e2 = c2 >> 8;
+                    UWORD p2 = (UWORD)(q[0] << 8 | q[1]), c2 = (UWORD)(q[HB] << 8 | q[HB + 1]); int v2 = p2 >> 8, e2 = c2 >> 8;
                     if (!p2 && !c2) break;
                     v2 |= (c2 & 4) << 6; e2 |= (c2 & 2) << 7;
                     if (e2 <= v2 || q - (UBYTE *)spr[n + 1] > 4600) break;
                     if (p2 == pos && (c2 & 0x80)) { o = q; break; }
-                    q += 16 + (e2 - v2) * 16;
+                    q += LB + (e2 - v2) * LB;
                 }
             }
-            for (l = 0; l < ve - vs; l++) for (x = 0; x < 64; x++) {
-                UBYTE *line = d + 16 + l * 16, *ol = o ? o + 16 + l * 16 : 0; int bx = x >> 3, bt = 7 - (x & 7), v, X = hs - 0x80 + x, Y = vs - 0x34 + l;
-                v = ((line[bx] >> bt) & 1) | (((line[8 + bx] >> bt) & 1) << 1);
-                if (ol) v |= (((ol[bx] >> bt) & 1) << 2) | (((ol[8 + bx] >> bt) & 1) << 3); else if (v) v |= (n >> 1) << 2;
+            for (l = 0; l < ve - vs; l++) for (x = 0; x < W; x++) {
+                UBYTE *line = d + LB + l * LB, *ol = o ? o + LB + l * LB : 0; int bx = x >> 3, bt = 7 - (x & 7), v, X = hs - 0x80 + x, Y = vs - 0x34 + l;
+                v = ((line[bx] >> bt) & 1) | (((line[HB + bx] >> bt) & 1) << 1);
+                if (ol) v |= (((ol[bx] >> bt) & 1) << 2) | (((ol[HB + bx] >> bt) & 1) << 3); else if (v) v |= (n >> 1) << 2;
                 if (v && X >= 0 && X < 320 && Y >= 0 && Y < 240) img[Y][X] = pal[16 + v];
             }
-            d += 16 + (ve - vs) * 16;
+            d += LB + (ve - vs) * LB;
         }
     }
     f = fopen(name, "wb"); fprintf(f, "P6\n320 240\n255\n");
