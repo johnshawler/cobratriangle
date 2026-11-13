@@ -846,8 +846,57 @@ _ntcopy:
         move.l  a2,-(sp)
         moveq   #1,d6
         btst    #2,_ppu_ctrl
-        beq.s   .l
+        beq     .l
         moveq   #32,d6
+        ; fast path: +32 a write, all of it inside one nametable's tile area: the cell address once
+        move.w  _ppu_v,d3
+        and.w   #$3fff,d3
+        cmp.w   #$2000,d3
+        bcs     .l
+        cmp.w   #$3000,d3
+        bcc     .l
+        move.w  d3,d0
+        and.w   #$3ff,d0
+        move.w  d7,d4
+        lsl.w   #5,d4
+        add.w   d0,d4                   ; offset of the last write in its nametable
+        cmp.w   #$3c0,d4
+        bcc     .l                      ; reaches the attributes or the next table: the general loop
+        move.w  d3,d4
+        lsr.w   #8,d4
+        lsr.w   #1,d4
+        and.w   #6,d4
+        lea     _nt_map,a0
+        or.w    (a0,d4.w),d0            ; d0 = nes_vram index of the first cell
+        move.w  d7,d4
+        addq.w  #1,d4
+        lsl.w   #5,d4
+        add.w   d4,_ppu_v               ; v after all of them
+        lea     _nes_vram,a0
+        adda.w  d0,a0
+.f      move.b  (a1)+,d4
+        cmp.b   (a0),d4
+        bne.s   .fw
+.fn     lea     32(a0),a0
+        add.w   #32,d0
+        dbf     d7,.f
+        move.l  (sp)+,a2
+        rts
+.fw     move.b  d4,(a0)                 ; changed: store and mark the cell
+        lea     _nes_dirty_flag,a2
+        tst.b   (a2,d0.w)
+        bne.s   .fn
+        cmp.w   #1024,_nes_ndirty
+        bcs.s   .fm
+        move.b  #1,_nes_redraw_all
+        bra.s   .fn
+.fm     move.b  #1,(a2,d0.w)
+        lea     _nes_dirty,a2
+        adda.w  _nes_ndirty,a2
+        adda.w  _nes_ndirty,a2
+        move.w  d0,(a2)
+        addq.w  #1,_nes_ndirty
+        bra.s   .fn
 .l      move.b  (a1)+,d4
         move.w  _ppu_v,d3
         and.w   #$3fff,d3

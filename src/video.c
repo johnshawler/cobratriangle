@@ -55,6 +55,7 @@
 #ifdef LOGIC_TRACE
 ULONG vprof[12], vtiles;                 /* debug: colour clocks in cell redraws, streaming, sprites; tiles drawn */
 extern uint32_t logic_frames;
+#define VPO(i, x) do { ULONG t0_ = sys_now(); x; if (logic_frames >= 2000 && logic_frames < 2500) vprof[i] += sys_now() - t0_; } while (0)
 #ifdef NOVP                             /* debug builds without the inner timers (their own cost is large) */
 #define VP(i, x) do { x; } while (0)
 #else
@@ -62,6 +63,7 @@ extern uint32_t logic_frames;
 #endif
 #else
 #define VP(i, x) do { x; } while (0)
+#define VPO(i, x) do { x; } while (0)
 #endif
 
 const DispCfg video_display = { PLANES, 1, 0, 240, BUF_H, LEVEL_W, 1, 0, SPR_W, 1 };
@@ -649,7 +651,7 @@ static void build_sprites(void)
     int k, s, n;
     UWORD off;
     spr_set ^= 1;
-    VP(3, { build_groups(); assign(); });
+    VPO(3, build_groups()); VPO(7, assign());
     for (k = 0; k < 7; k++) {                           /* where each segment goes in its sprite's list */
         off = 0;
         for (s = 0; s < hn[k]; s++) {
