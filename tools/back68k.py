@@ -231,6 +231,10 @@ def generate(g):
         if mode in ('zp', 'zpx', 'zpy') or (mode == 'abs' and arg < 0x2000) or (mode in ('abx', 'aby') and arg < 0x2000 and (arg & 0x7ff) + 255 < 0x900):
             pre, op, _ = operand(mode, arg)
             return pre + ['move.b %s,%s' % (reg, op)], False
+        if mode == 'abs' and (arg in LEAN or (AX and arg >= 0x8000)):  # a helper for this register alone
+            key = 0x8000 if arg >= 0x8000 else arg
+            lean_used.add((key, reg))
+            return ['bsr _w%04x_%s' % (key, reg)], None
         if mode == 'abs':
             return ['lea $%04x.w,a0' % arg if arg < 0x8000 else 'movea.l #$%04x,a0' % arg, 'bsr _io_wr_%s' % reg], None
         if mode in ('abx', 'aby'):
@@ -242,6 +246,8 @@ def generate(g):
             return ['lea %d(a5,d1.w),a0' % (arg - 0x80), 'moveq #0,d7', 'move.w (a0),d7', 'rol.w #8,d7', 'movea.l d7,a0', 'bsr _wr_ea_%s' % reg], True
         raise ValueError(mode)
 
+    LEAN = {0x2000, 0x2001, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007}
+    lean_used = set()
     stubcount = [0]
     def newstub():
         stubcount[0] += 1
@@ -546,6 +552,13 @@ def generate(g):
         E('    move.w #$%04x,d7' % t)
         E('    bra _dispatch')
 
+    # lean store helpers: the value into d4 (zero-extended), the flags onto the stack, then the register's code
+    for key, reg in sorted(lean_used):
+        E('_w%04x_%s:' % (key, reg))
+        E('    move.w ccr,-(sp)')
+        E('    moveq #0,d4')
+        E('    move.b %s,d4' % reg)
+        E('    bra _w%04x' % key)
     # the run-time helpers, in this same code section
     E('    include "src/nes68k.s"')
     # dispatch: an open-addressing hash of (bank, address) -> function. Bank 7 for $C000-$FFFF.

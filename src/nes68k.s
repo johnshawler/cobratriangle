@@ -615,3 +615,159 @@ N       set     0
         dc.b    (N-1)&255
 N       set     N+1
         endr
+
+        section gencode,code
+; ---- lean store helpers for single registers (tools/back68k.py calls _wXXXX_dN, which puts the value in d4,
+; zero-extended, and the flags on the stack). They may change d3, d4, a0 and a1 only, and end with the flags.
+_w2000: move.b  d4,_ppu_ctrl
+        move.w  _ppu_t,d3
+        and.w   #$f3ff,d3
+        and.w   #3,d4
+        lsl.w   #8,d4
+        lsl.w   #2,d4
+        or.w    d4,d3
+        move.w  d3,_ppu_t
+        move.w  (sp)+,ccr
+        rts
+_w2001: move.b  d4,_ppu_mask
+        move.w  (sp)+,ccr
+        rts
+_w2003: move.b  d4,_ppu_oamaddr
+        move.w  (sp)+,ccr
+        rts
+_w2004: moveq   #0,d3
+        move.b  _ppu_oamaddr,d3
+        lea     _nes_oam,a0
+        move.b  d4,(a0,d3.w)
+        addq.b  #1,_ppu_oamaddr
+        move.w  (sp)+,ccr
+        rts
+_w2005: tst.b   _ppu_w
+        bne.s   .b
+        move.b  d4,d3
+        and.b   #7,d3
+        move.b  d3,_ppu_fx
+        lsr.b   #3,d4
+        move.w  _ppu_t,d3
+        and.w   #$ffe0,d3
+        or.w    d4,d3
+        move.w  d3,_ppu_t
+        move.b  #1,_ppu_w
+        move.w  (sp)+,ccr
+        rts
+.b      move.w  d4,d3
+        and.w   #7,d3
+        ror.w   #4,d3                   ; << 12
+        and.w   #$f8,d4
+        lsl.w   #2,d4
+        or.w    d3,d4
+        move.w  _ppu_t,d3
+        and.w   #$8c1f,d3
+        or.w    d4,d3
+        move.w  d3,_ppu_t
+        clr.b   _ppu_w
+        move.w  (sp)+,ccr
+        rts
+_w2006: move.w  _ppu_t,d3
+        tst.b   _ppu_w
+        bne.s   .b
+        and.w   #$00ff,d3
+        and.w   #$3f,d4
+        lsl.w   #8,d4
+        or.w    d4,d3
+        move.w  d3,_ppu_t
+        move.b  #1,_ppu_w
+        move.w  (sp)+,ccr
+        rts
+.b      and.w   #$ff00,d3
+        or.w    d4,d3
+        move.w  d3,_ppu_t
+        move.w  d3,_ppu_v
+        clr.b   _ppu_w
+        move.w  (sp)+,ccr
+        rts
+_w2007: move.w  _ppu_v,d3
+        and.w   #$3fff,d3
+        cmp.w   #$2000,d3
+        bcs     .chr
+        cmp.w   #$3f00,d3
+        bcc     .slow
+        move.l  d0,-(sp)                ; nametable cell: nt_map[(v >> 10) & 3] | (v & $3ff)
+        move.w  d3,d0
+        lsr.w   #8,d0
+        lsr.w   #1,d0
+        and.w   #6,d0
+        lea     _nt_map,a1
+        and.w   #$3ff,d3
+        or.w    (a1,d0.w),d3
+        move.l  (sp)+,d0
+        lea     _nes_vram,a0
+        cmp.b   (a0,d3.w),d4
+        beq.s   .inc
+        move.b  d4,(a0,d3.w)
+        lea     _nes_dirty_flag,a0
+        tst.b   (a0,d3.w)
+        bne.s   .inc
+        cmp.w   #1024,_nes_ndirty       ; NES_DIRTY_MAX
+        bcs.s   .mk
+        move.b  #1,_nes_redraw_all
+        bra.s   .inc
+.mk     move.b  #1,(a0,d3.w)
+        lea     _nes_dirty,a1
+        adda.w  _nes_ndirty,a1
+        adda.w  _nes_ndirty,a1
+        move.w  d3,(a1)
+        addq.w  #1,_nes_ndirty
+.inc    btst    #2,_ppu_ctrl
+        bne.s   .i32
+        addq.w  #1,_ppu_v
+        move.w  (sp)+,ccr
+        rts
+.i32    add.w   #32,_ppu_v
+        move.w  (sp)+,ccr
+        rts
+.chr    cmp.b   #7,_nes_mapper          ; CHR RAM: store and mark the tile; CHR ROM: nothing
+        bne.s   .inc
+        lea     _nes_chr_ram,a0
+        cmp.b   (a0,d3.w),d4
+        beq.s   .inc
+        move.b  d4,(a0,d3.w)
+        lsr.w   #4,d3
+        lea     _chr_dirty_flag,a0
+        tst.b   (a0,d3.w)
+        bne.s   .inc
+        move.b  #1,(a0,d3.w)
+        lea     _chr_dirty,a1
+        adda.w  _chr_ndirty,a1
+        adda.w  _chr_ndirty,a1
+        move.w  d3,(a1)
+        addq.w  #1,_chr_ndirty
+        bra.s   .inc
+.slow   move.w  (sp)+,ccr               ; palette: the general path
+        lea     $2007.w,a0
+        bra     _io_wr_d4
+_w8000: move.b  _ax_reg,d3              ; AxROM bank register: 32 KB bank, one-screen page in bit 4
+        move.b  d4,_ax_reg
+        eor.b   d4,d3
+        and.l   #3,d4
+        move.b  d4,_nes_bank
+        lsl.l   #8,d4
+        lsl.l   #7,d4                   ; bank * $8000
+        lea     _nes_prg_data,a3
+        adda.l  d4,a3
+        move.l  a3,_nes_prg_lo
+        lea     $4000(a3),a4
+        move.l  a4,_nes_prg_hi
+        btst    #4,d3
+        beq.s   .d
+        moveq   #0,d3
+        btst    #4,_ax_reg
+        beq.s   .p
+        move.w  #$400,d3
+.p      lea     _nt_map,a0
+        move.w  d3,(a0)+
+        move.w  d3,(a0)+
+        move.w  d3,(a0)+
+        move.w  d3,(a0)+
+.d      move.w  (sp)+,ccr
+        rts
