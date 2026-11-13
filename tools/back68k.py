@@ -223,6 +223,11 @@ def generate(g):
             if arg >= 0x8000 and arg + 255 < 0xc000: return [], '(%d,a3,%s.w)' % (arg - 0x8000, r), False
             return ['movea.l #$%04x,a0' % arg, 'adda.l %s,a0' % r, 'bsr _rd_ea'], 'd4', True
         if mode == 'izy':
+            if AX:                              # the pointer is nearly always into ROM: read it here (a3 = $8000)
+                st = newstub()
+                return ['moveq #0,d7', 'move.w %d(a5),d7' % (arg - 0x80), 'rol.w #8,d7', 'movea.l d7,a0', 'adda.l d2,a0',
+                        'cmpa.l #$8000,a0', 'bcs.s %sa' % st, 'move.b (-$8000,a3,a0.l),d4', 'bra.s %sb' % st,
+                        '%sa:' % st, 'bsr _rd_ea', '%sb:' % st], 'd4', True
             return ['moveq #0,d7', 'move.w %d(a5),d7' % (arg - 0x80), 'rol.w #8,d7', 'movea.l d7,a0', 'adda.l d2,a0', 'bsr _rd_ea'], 'd4', True
         if mode == 'izx':
             return ['lea %d(a5,d1.w),a0' % (arg - 0x80), 'moveq #0,d7', 'move.w (a0),d7', 'rol.w #8,d7', 'movea.l d7,a0', 'bsr _rd_ea'], 'd4', True
@@ -250,6 +255,7 @@ def generate(g):
 
     LEAN = {0x2000, 0x2001, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007}
     lean_used = set()
+    icn = [0]
     stubcount = [0]
     def newstub():
         stubcount[0] += 1
@@ -498,7 +504,12 @@ def generate(g):
                         L += ['move.b %d(a5),d7' % ((hi & 0x7ff) - 0x80), 'lsl.w #8,d7', 'move.b %d(a5),d7' % ((arg & 0x7ff) - 0x80)]
                     else:
                         L += ['lea $%04x.w,a0' % hi, 'bsr _rd_ea', 'move.b d4,d7', 'lsl.w #8,d7', 'lea $%04x.w,a0' % arg, 'bsr _rd_ea', 'move.b d4,d7']
-                    L.append('jmp _dispatch')
+                    if AX:                          # a cache per jump site: the last (address, bank) and its function
+                        icn[0] += 1; st = newstub()
+                        L += ['lea _ic%d,a0' % icn[0], 'cmp.w (a0),d7', 'bne.s %sm' % st, 'move.b _nes_bank,d4',
+                              'cmp.b 2(a0),d4', 'bne.s %sm' % st, 'movea.l 4(a0),a1', 'move.w d6,ccr', 'jmp (a1)',
+                              '%sm:' % st, 'jmp _dispatch_ic']
+                    else: L.append('jmp _dispatch')
             elif m == 'JSR':
                 ret = (a + 2) & 0xffff
                 sw = ((ret & 0xff) << 8) | (ret >> 8)
@@ -540,6 +551,8 @@ def generate(g):
             for l in lines: E('    ' + l)
 
     # dynamic call stubs: the bank decides which function a call into $8000-$BFFF reaches
+    E('    xdef _dynstubs')
+    E('_dynstubs:')                         # (a symbol, so that profiler samples here get a name)
     for t, lab in sorted(dynstubs.items()):
         E('%s:' % lab)
         E('    move.w ccr,d6')
@@ -555,6 +568,8 @@ def generate(g):
         E('    bra _dispatch')
 
     # lean store helpers: the value into d4 (zero-extended), the flags onto the stack, then the register's code
+    E('    xdef _lean_prologues')
+    E('_lean_prologues:')
     for key, reg in sorted(lean_used):
         E('_w%04x_%s:' % (key, reg))
         E('    move.w ccr,-(sp)')
@@ -575,6 +590,9 @@ def generate(g):
     E('_disp_hash:')
     for sl in slots:
         E('    dc.w 0,0,0,0' if sl is None else '    dc.w $%04x,%d\n    dc.l %s' % (sl[1], sl[0], fname(sl[0], sl[1])))
+    E('    section genbss,bss')
+    for k in range(1, icn[0] + 1): E('_ic%d: ds.l 2' % k)
+    E('    section gendata,data')
     E('_reset_fn: dc.l %s' % fname(RESET_BANK, reset))
     E('_nmi_fn: dc.l %s' % fname(RESET_BANK, nmi))
 

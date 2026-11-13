@@ -6,6 +6,7 @@
 ; This file is included by src/gen68k.s, in its code section, so that the many bsr to these helpers stay
 ; inside one section. It is not assembled on its own.
         xdef    _asm_run,_asm_dispatch
+        xdef    _w2000,_w2001,_w2003,_w2004,_w2005,_w2006,_w2007,_w8000,_r4016,_r2007
         xdef    _dispatch,_unwind,_io_rd,_io_wr,_rd_ea,_wr_ea_d0,_php,_plp,_set_prg,_wait   ; for the profiler only
         xref    _cpu_a,_cpu_s,_cpu_x,_cpu_y,_cpu_c,_cpu_z,_cpu_n,_cpu_v,_cpu_i,_cpu_d
 ;       _cpu_x,_cpu_y,_cpu_s,_cpu_c,_cpu_z,_cpu_n,_cpu_v,_cpu_i,_cpu_d
@@ -116,8 +117,26 @@ _rti:
         movea.l (sp)+,a0
         jmp     2(a0)
 
+; ---- as _dispatch, and remember the result in the jump site's cache at a0: address.w, bank.b, function.l
+_dispatch_ic:
+        move.l  a0,-(sp)
+        move.w  d7,(a0)
+        move.b  _nes_bank,2(a0)
+        pea     .fill(pc)
+        bra.s   _dispatch_find
+.fill   movea.l (sp)+,a0                ; a1 = the function: keep it
+        move.l  a1,4(a0)
+        move.w  d6,ccr
+        jmp     (a1)
+
 ; ---- jump to the translated function for d7.w in the mapped bank; d6 = the flags to restore
 _dispatch:
+        pea     .go(pc)
+        bra.s   _dispatch_find
+.go     move.w  d6,ccr
+        jmp     (a1)
+_dispatch_find:                         ; -> a1 = the function (returns), or _fatal
+
         movem.l d0-d2,-(sp)
         moveq   #0,d0
         move.w  d7,d0                   ; address
@@ -147,9 +166,9 @@ _dispatch:
         bra.s   .probe
 .found  movea.l 4(a0,d3.w),a1
         movem.l (sp)+,d0-d2
-        move.w  d6,ccr
-        jmp     (a1)
+        rts
 .nf     movem.l (sp)+,d0-d2
+        addq.l  #4,sp                   ; the caller's continuation
         moveq   #3,d4
         bra.s   _fatal
 _fatal_op:

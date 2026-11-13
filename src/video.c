@@ -49,7 +49,7 @@
 #endif
 
 #ifdef LOGIC_TRACE
-ULONG vprof[8], vtiles;                 /* debug: colour clocks in cell redraws, streaming, sprites; tiles drawn */
+ULONG vprof[12], vtiles;                 /* debug: colour clocks in cell redraws, streaming, sprites; tiles drawn */
 extern uint32_t logic_frames;
 #define VP(i, x) do { ULONG t0_ = sys_now(); x; if (logic_frames >= 2000 && logic_frames < 2500) vprof[i] += sys_now() - t0_; } while (0)
 #else
@@ -405,7 +405,7 @@ static void build_groups(void)
         WORD sy = (WORD)y + 1;
         if (y >= 0xef) continue;
         if (spr_split && sy + 8 > pf_h && sy + 4 < BAR_SHOW) continue;   /* in the blank lines between */
-        for (j = ngrp > 4 ? ngrp - 4 : 0; j < ngrp; j++) {   /* a metasprite's sprites come together in OAM */
+        for (j = ngrp - 1; j >= 0 && j >= ngrp - 4; j--) {  /* a metasprite's sprites come together in OAM: newest first */
             Group *g = &grp[j];
             WORD nx0 = x < g->x0 ? x : g->x0, nx1 = x + 8 > g->x1 ? x + 8 : g->x1;
             if (nx1 - nx0 > SPR_W || g->n >= MAXIN) continue;
@@ -417,7 +417,7 @@ static void build_groups(void)
             g->pals |= (UBYTE)(1 << (nes_oam[i * 4 + 2] & 3));
             break;
         }
-        if (j >= ngrp) {
+        if (j < 0 || j < ngrp - 4) {
             Group *g = &grp[ngrp++];
             g->x0 = x; g->x1 = x + 8; g->y0 = sy; g->y1 = sy + 8; g->n = 1; g->idx[0] = (UBYTE)i;
             g->pals = (UBYTE)(1 << (nes_oam[i * 4 + 2] & 3));
@@ -502,7 +502,9 @@ static void clear_lines(UBYTE *p, int n)
     for (n >>= 4; n; n--) { l[0] = 0; l[1] = 0; l[2] = 0; l[3] = 0; l += 4; }
 }
 
-static UBYTE scr_e[16 * 256], scr_o[16 * 256];    /* one segment is put together here (fast RAM if there is any) */
+#define ARENA 49152
+static UBYTE *arena[2];                 /* fast RAM (if any): every segment of a sprite set, the cache's copy */
+static ULONG arena_used;
 
 /* Segments drawn last frame, by content: a cluster with the same sprites, tiles, attributes and layout is
    copied from the previous set of sprite lists (which stays untouched while this set is built). */
@@ -526,7 +528,7 @@ static ULONG group_sig(Group *g, int with_o)
         int i = g->idx[k];
         ULONG v = ((ULONG)nes_oam[i * 4 + 1] << 24) | ((ULONG)nes_oam[i * 4 + 2] << 16)
                 | ((ULONG)(UBYTE)(nes_oam[i * 4 + 3] - g->x0) << 8) | (UBYTE)(nes_oam[i * 4] + 1 - g->y0);
-        h = (h ^ v) * 16777619UL + (ULONG)k;
+        h = ((h << 5) | (h >> 27)) + (v ^ (ULONG)k);   /* no multiply: there is no fast one on this CPU */
     }
     return h;
 }
@@ -552,6 +554,7 @@ static void build_sprites(void)
     UWORD off;
     spr_set ^= 1;
     ncache[spr_set] = 0;
+    arena_used = 0;
     VP(3, { build_groups(); assign(); });
     for (k = 0; k < 7; k++) {                           /* where each segment goes in its sprite's list */
         off = 0;
@@ -574,26 +577,40 @@ static void build_sprites(void)
         n = (g->y1 - g->y0) * 16;
         e = spr_mem[spr_set][g->se] + g->oe;
         o = g->so >= 0 ? spr_mem[spr_set][g->so] + g->oo : 0;
+        VP(8, {
         put_ctl((UWORD)g->se, e, g, 0);
         if (o) put_ctl((UWORD)g->so, o, g, 1);
         sig = group_sig(g, o != 0);
         if (!group_changed(g))
-            for (j = 0; j < ncache[spr_set ^ 1]; j++) if (cp[j].sig == sig && cp[j].n == n) { hit = &cp[j]; break; }
+            for (j = 0; j < ncache[spr_set ^ 1]; j++) if (cp[j].sig == sig && cp[j].n == n) { hit = &cp[j]; break; } });
         vstat[0]++;
-        if (hit) {
-            vstat[1]++;
-            copy_lines(e + 16, hit->e, n);
-            if (o) copy_lines(o + 16, hit->o, n);
-        } else {
-            clear_lines(scr_e, n);
-            if (o) clear_lines(scr_o, n);
-            render_group(g, scr_e, o ? scr_o : 0); vstat[2] += g->n;
-            copy_lines(e + 16, scr_e, n);           /* chip RAM is only written, once, a long at a time */
-            if (o) copy_lines(o + 16, scr_o, n);
-        }
-        if (ncache[spr_set] < 64) {
-            Cached *c2 = &cache[spr_set][ncache[spr_set]++];
-            c2->sig = sig; c2->n = (UWORD)n; c2->e = e + 16; c2->o = o ? o + 16 : 0;
+        {   UBYTE *ae, *ao = 0;
+            if (arena_used + 2 * (ULONG)n > ARENA) continue;   /* (never: 64 segments of 240 lines fit) */
+            ae = arena[spr_set] + arena_used; arena_used += n;
+            if (o) { ao = arena[spr_set] + arena_used; arena_used += n; }
+            ULONG t9 = 0;
+#ifdef LOGIC_TRACE
+            t9 = sys_now();
+#endif
+            if (hit) {                              /* fast RAM to fast RAM: the cache for the next frame */
+                vstat[1]++;
+                copy_lines(ae, hit->e, n);
+                if (o) copy_lines(ao, hit->o, n);
+            } else {
+                clear_lines(ae, n);
+                if (o) clear_lines(ao, n);
+                render_group(g, ae, ao); vstat[2] += g->n;
+            }
+#ifdef LOGIC_TRACE
+            if (logic_frames >= 2000 && logic_frames < 2500) vprof[9] += sys_now() - t9;
+#endif
+            VP(10, { copy_lines(e + 16, ae, n);              /* chip RAM is only written, once, a long at a time */
+            if (o) copy_lines(o + 16, ao, n); });
+            (void)t9;
+            if (ncache[spr_set] < 64) {
+                Cached *c2 = &cache[spr_set][ncache[spr_set]++];
+                c2->sig = sig; c2->n = (UWORD)n; c2->e = ae; c2->o = ao;
+            }
         }
     }
 }
@@ -621,6 +638,7 @@ int video_load(void)
         for (j = 0; j < 7; j++)
             if (!(spr_mem[i][j] = sys_alloc(SPR_BYTES, MEMF_CHIP | MEMF_CLEAR))) return 0;
     if (!(bar_bm = sys_alloc(4 * BAR_PLANE, MEMF_CHIP | MEMF_CLEAR))) return 0;
+    for (i = 0; i < 2; i++) if (!(arena[i] = sys_alloc(ARENA, MEMF_ANY | MEMF_CLEAR))) return 0;
     video_plane = 0;
     invalidate();
     return 1;
@@ -703,8 +721,6 @@ void video_frame(void)
     VP(1, stream_cols(budget));
     if (!(col_lo <= vlo && col_hi >= vhi)) on = 0;
     VP(6, if (col_lo <= col_hi) fix_edges());
-    if (split && on) VP(5, bar_frame(sy, bar_dirty));
-    else bar_x = -1;
 
     if (nes_pal_dirty || on != was_on || pal0 != last_pal0) { set_palette(on, pal0); nes_pal_dirty = 0; was_on = (UBYTE)on; last_pal0 = pal0; }
     disp_scroll(cam_ux - VIEW_X, sy);
@@ -719,5 +735,7 @@ void video_frame(void)
         if (spr_chr_dirty) memset(spr_tchg, 0, sizeof spr_tchg);
     }
     else { for (i = 0; i < 7; i++) disp_sprite_off((UWORD)i); spr_valid = 0; }
-    bar_finish();
+    /* the status bar last: its blits run on while the CPU goes on with the next ticks in fast RAM */
+    if (split && on) VP(5, bar_frame(sy, bar_dirty));
+    else bar_x = -1;
 }

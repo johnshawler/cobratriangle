@@ -150,8 +150,11 @@ int main(int argc, char **argv)
                 if (fh) { Write(fh, logic_dump, 0x808); Close(fh); } }
             {   extern uint32_t video_time_sum, video_time_max, video_calls; char b[300];
                 extern ULONG vprof[], vtiles;
-                sprintf(b, "video avg %lu max %lu calls %lu cells %lu stream %lu sprites %lu (grouping %lu) tiles %lu chr %lu bar %lu edges %lu\n", (unsigned long)(video_calls ? video_time_sum / video_calls : 0), (unsigned long)video_time_max, (unsigned long)video_calls,
-                        (unsigned long)vprof[0], (unsigned long)vprof[1], (unsigned long)vprof[2], (unsigned long)vprof[3], (unsigned long)vtiles, (unsigned long)vprof[4], (unsigned long)vprof[5], (unsigned long)vprof[6]);
+                sprintf(b, "video avg %lu max %lu calls %lu cells %lu stream %lu sprites %lu (grouping %lu) tiles %lu chr %lu bar %lu edges %lu ctlsig %lu render %lu chipcopy %lu\n", (unsigned long)(video_calls ? video_time_sum / video_calls : 0), (unsigned long)video_time_max, (unsigned long)video_calls,
+                        (unsigned long)vprof[0], (unsigned long)vprof[1], (unsigned long)vprof[2], (unsigned long)vprof[3], (unsigned long)vtiles, (unsigned long)vprof[4], (unsigned long)vprof[5], (unsigned long)vprof[6], (unsigned long)vprof[8], (unsigned long)vprof[9], (unsigned long)vprof[10]);
+                {   extern uint8_t nes_ram[], nes_vram[]; extern const uint8_t nes_prg_data[]; extern void *reset_fn;
+                    sprintf(b + strlen(b), "nes_ram %08lx nes_vram %08lx prg %08lx code %08lx stack %08lx\n", (unsigned long)nes_ram, (unsigned long)nes_vram,
+                            (unsigned long)nes_prg_data, (unsigned long)reset_fn, (unsigned long)&b); }
                 fh = Open((CONST_STRPTR)"video.txt", MODE_NEWFILE); if (fh) { Write(fh, b, strlen(b)); Close(fh); } }
             {   extern void *reset_fn; extern ULONG prof_buf[], prof_cnt; ULONG base = (ULONG)reset_fn; fh = Open((CONST_STRPTR)"prof.bin", MODE_NEWFILE);
                 ULONG cbase = (ULONG)game_tick; if (fh) { Write(fh, &base, 4); Write(fh, &cbase, 4); Write(fh, prof_buf, prof_cnt * 4); Close(fh); } }
