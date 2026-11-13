@@ -99,3 +99,4 @@ int main(int argc, char **argv)
     printf("sprite clusters dropped: %d\n", video_sprites_dropped);
     return 0;
 }
+unsigned long AvailMem(unsigned long f) { (void)f; return 8UL << 20; }
