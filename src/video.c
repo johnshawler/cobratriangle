@@ -57,7 +57,9 @@
 #ifdef LOGIC_TRACE
 ULONG vprof[12], vtiles;                 /* debug: colour clocks in cell redraws, streaming, sprites; tiles drawn */
 extern uint32_t logic_frames;
-#define VPO(i, x) do { ULONG t0_ = sys_now(); x; if (logic_frames >= 2000 && logic_frames < 2500) vprof[i] += sys_now() - t0_; } while (0)
+ULONG vpf[8192][6]; ULONG vpf_n;        /* debug: per-frame times of the blocks below (framestat.py) */
+#define VPO(i, x) do { ULONG t0_ = sys_now(), d_; x; d_ = sys_now() - t0_; if (logic_frames >= 2000 && logic_frames < 2500) vprof[i] += d_; \
+    if (vpf_n < 8192 && (i) < 6) vpf[vpf_n][(i)] += d_; } while (0)
 #ifdef NOVP                             /* debug builds without the inner timers (their own cost is large) */
 #define VP(i, x) do { x; } while (0)
 #else
@@ -183,7 +185,8 @@ static void want_cols(LONG *lo, LONG *hi)
     *hi = (cam_ux - VIEW_X + 320 + 8) >> 3;
 }
 
-static void invalidate(void) { col_lo = 1; col_hi = 0; work_row = -1; memset(tused, 0, sizeof tused); }
+static UBYTE attr_seen_init;
+static void invalidate(void) { col_lo = 1; col_hi = 0; work_row = -1; memset(tused, 0, sizeof tused); attr_seen_init = 1; }
 
 /* make every row's copies have the lines the scroll position sy shows */
 static void sync_rows(int sy)
@@ -251,24 +254,42 @@ static void fix_edges(void)
 }
 
 /* the NES changed playfield nametable cell i: redraw it where it is on screen (or the 16 tiles of an attribute cell) */
+/* Cells to draw again this frame, each once however often it changed (a new strip of terrain writes its tiles
+   and then the attribute bytes over them). */
+static UBYTE pend[30][32];
+static UWORD pend_list[960];
+static int npend;
+static UBYTE attr_seen[64];             /* the playfield's attribute bytes the drawn picture shows */
+static void mark_cell(int r, int cx) { if (r < 30 && !pend[r][cx]) { pend[r][cx] = 1; pend_list[npend++] = (UWORD)(r << 5 | cx); } }
+
+/* the NES changed playfield nametable cell i: its tile, or for an attribute byte the 2x2 groups whose palette changed */
 static void redraw_cell(UWORD i)
 {
+    if ((i & 0x3ff) < 0x3c0) mark_cell((i >> 5) & 31, i & 31);
+    else {
+        int a = i & 0x3f, ax = (a & 7) * 4, ay = (a >> 3) * 4, q;
+        UBYTE nv = nes_vram[pf_page | 0x3c0 | a], diff = (UBYTE)(nv ^ attr_seen[a]);
+        attr_seen[a] = nv;
+        for (q = 0; q < 4; q++)
+            if (diff & (3 << (2 * q))) {
+                int r = ay + (q >> 1) * 2, c = ax + (q & 1) * 2;
+                mark_cell(r, c); mark_cell(r, c + 1); mark_cell(r + 1, c); mark_cell(r + 1, c + 1);
+            }
+    }
+}
+
+static void flush_cells(void)
+{
+    int k;
     LONG uc;
-    int r, c;
-    if ((i & 0x3ff) < 0x3c0) {
-        int cx = i & 31, row = (i >> 5) & 31;
-        if (row >= 30) return;
+    for (k = 0; k < npend; k++) {
+        int row = pend_list[k] >> 5, cx = pend_list[k] & 31;
+        pend[row][cx] = 0;
+        if (col_lo > col_hi) continue;
         for (uc = col_lo + ((cx - col_lo) & 31); uc <= col_hi; uc += 32) draw_tile(uc, row);
         if (work_row > row && (work_col & 31) == cx) draw_tile(work_col, row);
-    } else {
-        int a = i & 0x3f, ax = (a & 7) * 4, ay = (a >> 3) * 4;
-        for (c = 0; c < 4; c++) {
-            for (uc = col_lo + ((ax + c - col_lo) & 31); uc <= col_hi; uc += 32)
-                for (r = ay; r < ay + 4 && r < 30; r++) draw_tile(uc, r);
-            if ((work_col & 31) == ax + c)
-                for (r = ay; r < ay + 4 && r < 30 && r < work_row; r++) draw_tile(work_col, r);
-        }
     }
+    npend = 0;
 }
 
 /* the game rewrote background tile t (0..255 in the background pattern table): redraw the cells showing it */
@@ -789,6 +810,7 @@ void video_frame(void)
         if (bp != bar_page) { bar_page = bp; bar_valid = 0; }
     }
 
+    if (attr_seen_init) { memcpy(attr_seen, nes_vram + pf_page + 0x3c0, 64); attr_seen_init = 0; }
     /* CHR RAM tiles the game rewrote */
     VPO(4, for (i = 0; i < chr_ndirty; i++) {
         UWORD tl = chr_dirty[i];
@@ -811,10 +833,11 @@ void video_frame(void)
         UWORD c = nes_dirty[i];
         nes_dirty_flag[c] = 0;
         if (nes_ndirty > 200) continue;
-        if ((c & 0x400) == pf_page && col_lo <= col_hi) VP(0, redraw_cell(c));
+        if ((c & 0x400) == pf_page && col_lo <= col_hi) redraw_cell(c);
         if (split && bar_valid && (c & 0x400) == bar_page && ((c & 0x3ff) < 0x100 || (c & 0x3ff) >= 0x3c0)) { bar_update_cell(c); bar_dirty = 1; }
     }
     nes_ndirty = 0;
+    VPO(0, flush_cells());
 
     /* while the visible part is incomplete (a new screen), show black and draw quickly */
     want_cols(&vlo, &vhi);
@@ -843,6 +866,9 @@ void video_frame(void)
     /* the status bar last: its blits run on while the CPU goes on with the next ticks in fast RAM */
     if (split && on) VPO(5, bar_frame(sy, bar_dirty));
     else bar_x = -1;
+#ifdef LOGIC_TRACE
+    if (vpf_n < 8192) vpf_n++;
+#endif
 #ifndef __m68k__
     {   int r, c; extern int vhost_frame;                /* host check: every shown row copy has its lines */
         for (r = 0; r < 30; r++) for (c = 0; c < 2; c++) {

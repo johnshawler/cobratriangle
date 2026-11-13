@@ -163,6 +163,7 @@ int main(int argc, char **argv)
                 if (fh) { Write(fh, &magic, 4); Write(fh, &base, 4); Write(fh, &cbase, 4); Write(fh, &vbase, 4); Write(fh, prof_buf, prof_cnt * 4); Close(fh); } }
             {   fh = Open((CONST_STRPTR)"frames.bin", MODE_NEWFILE); if (fh) { Write(fh, frame_log, frame_n * 8); Close(fh); } }
             {   fh = Open((CONST_STRPTR)"framevt.bin", MODE_NEWFILE); if (fh) { Write(fh, frame_vt, frame_n * 4); Close(fh); } }
+            {   extern ULONG vpf[][6], vpf_n; fh = Open((CONST_STRPTR)"vpf.bin", MODE_NEWFILE); if (fh) { Write(fh, vpf, vpf_n * 24); Close(fh); } }
             {   extern uint32_t logic_time[]; fh = Open((CONST_STRPTR)"ticktime.bin", MODE_NEWFILE);
                 if (fh) { Write(fh, logic_time, logic_ntrace * 4); Close(fh); } }
         }
