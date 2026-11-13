@@ -9,3 +9,4 @@
 - The brief's Step 1 route for 6502 code does not mention bank switching that swaps all of $8000-$FFFF under the
   running code (AxROM): the translator must end a function at the bank write and dispatch the rest.
 - tools/debug_run.sh and tools/shot_at.sh had the previous game's program name built in; they now use NAME from port.conf.
+- tools/bench.sh boots AROS only; the real Kickstart is reached by passing --kickstart_file=<rom> as an extra option (worked unchanged).

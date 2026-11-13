@@ -15,14 +15,16 @@ Stock A1200 bench:     frames=996 late=2606 worst_cck=2636781 avg_cck=213348 bud
                        ticks=3000 checksum=21a7571d  (FS-UAE 3.1.66, A1200 model, AROS ROM)
 With 4 MB fast RAM:    frames=1342 late=1713 worst_cck=1671625 avg_cck=111312 budget_cck=71051 worst_pct=2352 avg_pct=156 display_hz=50 shown_fps=21.9
                        ticks=3000 checksum=21a7571d
+Kickstart 3.1 (40.68):  frames=998 late=2605 worst_cck=2636297 avg_cck=212858 budget_cck=71051 worst_pct=3710 avg_pct=299 display_hz=50 shown_fps=13.8
+                       ticks=3000 checksum=21a7571d  (the user's Commodore ROM via --kickstart_file, stock A1200;
+                       takeover and return to the AmigaDOS shell checked on a screenshot)
 Host checksum:         21a7571d after 3000 ticks  equal (stock and fast RAM)
 Frame rate claim:      13.8 fps shown on the stock A1200, 21.9 fps with 4 MB fast RAM, logic at 50 ticks (game
                        time exact). 50 Hz NOT held: tools/port.sh prints FAIL (late, worst_pct). The stock machine
                        cannot hold 50 Hz by translation (load measured on day one: 7,450-8,700 6502 instructions a
                        frame); the cheapest upgrade that might, with more hand-written routines, is fast RAM; a
                        68030 accelerator is the safe one (not measured).
-Not done, not tested:  real hardware; the Commodore Kickstart 3.1 ROM the user supplied (every bench ran under
-                       the AROS ROM, as tools/bench.sh does); NTSC; sound not listened to (the APU-on-Paula code of
+Not done, not tested:  real hardware; fast RAM under Kickstart 3.1 (only AROS); NTSC; sound not listened to (the APU-on-Paula code of
                        the previous port is built in, unchanged); DMC samples; a 68030 bench; play-testing by a person
                        beyond the scripted bench; the overscan border shows the playfield backdrop colour.
 How to run:            tools/make_assets.sh (needs original/cobra.nes), then tools/port.sh builds dist/cobra.
