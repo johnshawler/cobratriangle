@@ -771,3 +771,51 @@ _w8000: move.b  _ax_reg,d3              ; AxROM bank register: 32 KB bank, one-s
         move.w  d3,(a0)+
 .d      move.w  (sp)+,ccr
         rts
+
+; ---- lean read helpers: -> d4; may change d3, a0, a1; keep the flags
+_r4016: move.w  ccr,-(sp)
+        move.b  _pad_shift,d4
+        tst.b   _pad_strobe
+        bne.s   .1
+        move.b  d4,d3
+        lsr.b   #1,d3
+        or.b    #$80,d3
+        move.b  d3,_pad_shift
+.1      and.b   #1,d4
+        or.b    #$40,d4
+        move.w  (sp)+,ccr
+        rts
+_r2007: move.w  ccr,-(sp)
+        move.w  _ppu_v,d3
+        and.w   #$3fff,d3
+        cmp.w   #$3f00,d3
+        bcc.s   .slow
+        cmp.w   #$2000,d3
+        bcc.s   .nt
+        cmp.b   #7,_nes_mapper
+        bne.s   .slow
+        lea     _nes_chr_ram,a0
+        bra.s   .got
+.nt     move.l  d0,-(sp)
+        move.w  d3,d0
+        lsr.w   #8,d0
+        lsr.w   #1,d0
+        and.w   #6,d0
+        lea     _nt_map,a1
+        and.w   #$3ff,d3
+        or.w    (a1,d0.w),d3
+        move.l  (sp)+,d0
+        lea     _nes_vram,a0
+.got    move.b  _ppu_rdbuf,d4
+        move.b  (a0,d3.w),_ppu_rdbuf
+        btst    #2,_ppu_ctrl
+        bne.s   .i32
+        addq.w  #1,_ppu_v
+        move.w  (sp)+,ccr
+        rts
+.i32    add.w   #32,_ppu_v
+        move.w  (sp)+,ccr
+        rts
+.slow   move.w  (sp)+,ccr
+        lea     $2007.w,a0
+        bra     _io_rd

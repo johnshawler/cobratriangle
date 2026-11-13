@@ -212,6 +212,8 @@ def generate(g):
             if arg < 0x2000: return [], '%d(a5)' % ((arg & 0x7ff) - 0x80), False
             if arg >= 0xc000: return [], '%d(a4)' % (arg - 0xc000), False
             if arg >= 0x8000: return [], '%d(a3)' % (arg - 0x8000), False
+            if arg == 0x4017: return ['moveq #$40,d4'], 'd4', True          # second pad: nothing there
+            if arg in (0x2007, 0x4016): return ['bsr _r%04x' % arg], 'd4', False   # lean helpers (src/nes68k.s)
             return ['lea $%04x.w,a0' % arg, 'bsr _io_rd'], 'd4', False
         if mode in ('abx', 'aby'):
             r = 'd1' if mode == 'abx' else 'd2'
