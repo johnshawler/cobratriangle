@@ -384,7 +384,7 @@ static void bar_frame(int sy, int moved)
    at least one free line between segments. */
 #define NSEG    24
 #define MAXIN   64
-typedef struct { WORD x0, x1, y0, y1; UBYTE n, pals; BYTE se, so; UWORD oe, oo; UBYTE idx[MAXIN]; } Group;
+typedef struct { WORD x0, x1, y0, y1; UBYTE n, pals; BYTE se, so; UWORD oe, oo; UBYTE ie, io; UBYTE idx[MAXIN]; } Group;
 static Group grp[64];
 static int ngrp;
 static Group *hseg[7][NSEG];            /* the clusters of each hardware sprite, top to bottom */
@@ -399,13 +399,27 @@ static int spr_split;                   /* under a split, sprite 0 only marks it
 static void build_groups(void)
 {
     int i, j, k;
+    WORD gx0 = 0, gx1 = 0, gy0 = 0, gy1 = 0;    /* the newest group, in registers while sprites join it */
+    UBYTE gn = 0, gp = 0, *gidx = 0;
+    const UBYTE *oam = nes_oam + (spr_split ? 4 : 0);
     ngrp = 0;
-    for (i = spr_split ? 1 : 0; i < 64; i++) {
-        UBYTE y = nes_oam[i * 4], x = nes_oam[i * 4 + 3];
-        WORD sy = (WORD)y + 1;
+    for (i = spr_split ? 1 : 0; i < 64; i++, oam += 4) {
+        WORD y = oam[0], x = oam[3], sy = (WORD)(y + 1);
         if (y >= 0xef) continue;
         if (spr_split && sy + 8 > pf_h && sy + 4 < BAR_SHOW) continue;   /* in the blank lines between */
-        for (j = ngrp - 1; j >= 0 && j >= ngrp - 4; j--) {  /* a metasprite's sprites come together in OAM: newest first */
+        if (gn) {                                       /* a metasprite's sprites come together in OAM */
+            WORD nx0 = x < gx0 ? x : gx0, nx1 = x + 8 > gx1 ? x + 8 : gx1;
+            if (nx1 - nx0 <= SPR_W && gn < MAXIN && sy <= gy1 + 1 && sy + 8 >= gy0 - 1 && x <= gx1 + 1 && x + 8 >= gx0 - 1) {
+                gx0 = nx0; gx1 = nx1;
+                if (sy < gy0) gy0 = sy;
+                if (sy + 8 > gy1) gy1 = sy + 8;
+                gidx[gn++] = (UBYTE)i;
+                gp |= (UBYTE)(1 << (oam[2] & 3));
+                continue;
+            }
+            { Group *g = &grp[ngrp - 1]; g->x0 = gx0; g->x1 = gx1; g->y0 = gy0; g->y1 = gy1; g->n = gn; g->pals = gp; }
+        }
+        for (j = ngrp - 2; j >= 0 && j >= ngrp - 4; j--) {  /* the three groups before it */
             Group *g = &grp[j];
             WORD nx0 = x < g->x0 ? x : g->x0, nx1 = x + 8 > g->x1 ? x + 8 : g->x1;
             if (nx1 - nx0 > SPR_W || g->n >= MAXIN) continue;
@@ -414,15 +428,15 @@ static void build_groups(void)
             if (sy < g->y0) g->y0 = sy;
             if (sy + 8 > g->y1) g->y1 = sy + 8;
             g->idx[g->n++] = (UBYTE)i;
-            g->pals |= (UBYTE)(1 << (nes_oam[i * 4 + 2] & 3));
+            g->pals |= (UBYTE)(1 << (oam[2] & 3));
             break;
         }
-        if (j < 0 || j < ngrp - 4) {
-            Group *g = &grp[ngrp++];
-            g->x0 = x; g->x1 = x + 8; g->y0 = sy; g->y1 = sy + 8; g->n = 1; g->idx[0] = (UBYTE)i;
-            g->pals = (UBYTE)(1 << (nes_oam[i * 4 + 2] & 3));
-        }
+        if (j >= 0 && j >= ngrp - 4) continue;
+        gidx = grp[ngrp++].idx;                         /* a new group, the newest */
+        gx0 = x; gx1 = x + 8; gy0 = sy; gy1 = sy + 8; gn = 1; gidx[0] = (UBYTE)i;
+        gp = (UBYTE)(1 << (oam[2] & 3));
     }
+    if (gn) { Group *g = &grp[ngrp - 1]; g->x0 = gx0; g->x1 = gx1; g->y0 = gy0; g->y1 = gy1; g->n = gn; g->pals = gp; }
     for (i = 0; i < ngrp; i++)                          /* merge groups that touch and share a palette, while they fit */
         for (j = i + 1; j < ngrp && j <= i + 6; j++) {
             Group *a = &grp[i], *b = &grp[j];
@@ -505,12 +519,17 @@ static void clear_lines(UBYTE *p, int n)
 /* Rendered clusters are kept in a pool (fast RAM if there is any), found again by a signature of their content:
    the tiles' pixels (a hash of each CHR RAM tile, so the boat's rotation frames, uploaded again and again into
    the same tiles, are recognised), attributes and layout. A hit is copied straight into the sprite list. */
+#ifndef NOSKIP
+#define NOSKIP 0
+#endif
 #define PC_LINES 64                     /* taller clusters are drawn every time */
 #define PC_BYTES (16 * PC_LINES)
 typedef struct { ULONG sig, last; UWORD n; UBYTE *e, *o; } PEnt;
 static PEnt *pc;
 static int pcn;                         /* entries: a power of two */
 static ULONG vframe;
+static ULONG slot_key[2][7][NSEG];      /* what each segment slot of each sprite list holds (0: unknown) */
+static UWORD slot_off[2][7][NSEG];
 static ULONG thash[512];                /* content hash of every CHR tile */
 static UBYTE scr_e[16 * 256], scr_o[16 * 256];    /* clusters that are not kept are put together here */
 
@@ -576,11 +595,12 @@ static void build_sprites(void)
         off = 0;
         for (s = 0; s < hn[k]; s++) {
             Group *g = hseg[k][s];
-            if (g->se == k) g->oe = off; else g->oo = off;
+            if (g->se == k) { g->oe = off; g->ie = (UBYTE)s; } else { g->oo = off; g->io = (UBYTE)s; }
             off = (UWORD)(off + 16 + (g->y1 - g->y0) * 16);
         }
         if (!hn[k]) disp_sprite_off((UWORD)k);
         else memset(spr_mem[spr_set][k] + off, 0, 16);  /* end of the list */
+        for (s = hn[k]; s < NSEG; s++) slot_key[spr_set][k][s] = 0;   /* slots beyond the list: overwritten or stale */
     }
     vframe++;
     for (k = 0; k < ngrp; k++) {
@@ -606,8 +626,18 @@ static void build_sprites(void)
             clear_lines(ae, n);
             if (o) clear_lines(ao, n);
             render_group(g, ae, o ? ao : 0); vstat[2] += g->n; });
-        VP(10, { copy_lines(e + 16, ae, n);         /* chip RAM is only written, once, a long at a time */
-                 if (o) copy_lines(o + 16, ao, n); });
+        {   /* a list slot that already holds this cluster's pixels (the same set, two frames ago) is not copied */
+            ULONG key = sig ^ (ULONG)n ^ (o ? 0x80000000UL : 0);
+            ULONG *ke = &slot_key[spr_set][g->se][g->ie];
+            VP(10, {
+            if (NOSKIP || *ke != key || slot_off[spr_set][g->se][g->ie] != g->oe) copy_lines(e + 16, ae, n);
+            *ke = key; slot_off[spr_set][g->se][g->ie] = g->oe;
+            if (o) {
+                ULONG *ko = &slot_key[spr_set][g->so][g->io];
+                if (NOSKIP || *ko != key || slot_off[spr_set][g->so][g->io] != g->oo) copy_lines(o + 16, ao, n);
+                *ko = key; slot_off[spr_set][g->so][g->io] = g->oo;
+            } });
+        }
     }
 }
 
