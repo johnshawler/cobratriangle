@@ -35,6 +35,7 @@ INV = {'bcc': 'bcs', 'bcs': 'bcc', 'beq': 'bne', 'bne': 'beq', 'bpl': 'bmi', 'bm
 
 def generate(g):
     HLE, HLE_FALLBACK = g['game'].HLE, g['game'].HLE_FALLBACK      # hand-written routines: per game (tools/games/)
+    HLE_PREFIX = getattr(g['game'], 'HLE_PREFIX', {})   # (bank, entry): (text, address the translation resumes at)
     entries, body, insn, ctx_of = g['entries'], g['body'], g['insn'], g['ctx_of']
     FIXED, NORETURN, static_branch, successors = g['FIXED'], g['NORETURN'], g['static_branch'], g['successors']
     wait_kind, rd, outdir = g['wait_kind'], g['rd'], g['outdir']
@@ -283,7 +284,13 @@ def generate(g):
             for l in ['move.w ccr,d6', 'movea.l (sp)+,a0', 'cmpm.w (a2)+,(a0)+', 'bne _unwind', 'move.w d6,ccr', 'jmp (a0)']: E('    ' + l)
             if (ctx, e) not in HLE_FALLBACK: continue
             E('.orig:')
-        if addrs and addrs[0] != e: E('    bra .L%04x' % e)
+        if (ctx, e) in HLE_PREFIX:              # hand-written first part, then the translation from 'resume' on
+            text, resume = HLE_PREFIX[(ctx, e)]
+            labels.add(resume)
+            E('; hand-written equivalent of the 6502 code up to $%04x' % resume)
+            for l in text.strip('\n').split('\n'): E(l)
+            E('    bra .L%04x' % resume)
+        elif addrs and addrs[0] != e: E('    bra .L%04x' % e)
         nzsrc = None; c68 = None; known_c = None; fuse = None
         # waits
         waits = {}

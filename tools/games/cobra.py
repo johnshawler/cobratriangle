@@ -74,3 +74,27 @@ def _upload(tab):
 HLE[(2, 0xffa1)] = _upload(0xde00 - 0x8000)
 HLE[(2, 0xffa9)] = _upload(0xee00 - 0x8000)
 HLE_FALLBACK |= {(2, 0xffa1), (2, 0xffa9)}
+
+# $D1A6 in bank 0, every play frame: two nametable columns of 30 cells from the buffer at $0130/$014F
+# ($2000 = $14: +32 a write; $2006 = $20, ($0130); 30 x LDA $0131+i / STA $2007; $2006 = $20, ($014F); 30 more),
+# then on at $D327. By hand with _ntcopy; leaves A = ($016D) with its N and Z, X = $20, C and V as they were.
+HLE_PREFIX = {(0, 0xd1a6): ('''
+    move.w ccr,-(sp)
+    move.b #$14,d0
+    bsr _w2000_d0
+    moveq #$20,d1
+    bsr _w2006_d1
+    move.b $0130-$80(a5),d0
+    bsr _w2006_d0
+    lea $0131-$80(a5),a1
+    moveq #29,d7
+    bsr _ntcopy
+    bsr _w2006_d1
+    move.b $014f-$80(a5),d0
+    bsr _w2006_d0
+    lea $0150-$80(a5),a1
+    moveq #29,d7
+    bsr _ntcopy
+    move.w (sp)+,ccr
+    move.b $016d-$80(a5),d0
+''', 0xd327)}

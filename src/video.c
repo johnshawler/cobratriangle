@@ -760,12 +760,17 @@ void video_frame(void)
     if (nes_pal_dirty || on != was_on || pal0 != last_pal0) { set_palette(on, pal0); nes_pal_dirty = 0; was_on = (UBYTE)on; last_pal0 = pal0; }
     disp_scroll(cam_ux - VIEW_X, sy);
     if ((mask & 0x10) && on) {
-        static UBYTE last_oam[256], last_state[4];
+        static ULONG last_oam[64];
+        static UBYTE last_state[4];
+        const ULONG *oam4 = (const ULONG *)nes_oam;
+        int same = 1;
         UBYTE st[4];
         st[0] = ppu_ctrl; st[1] = (UBYTE)split; st[2] = (UBYTE)pf_h; st[3] = 0;
-        if (!spr_valid || spr_chr_dirty || memcmp(last_oam, nes_oam, 256) || memcmp(last_state, st, 4)) {
+        for (i = 0; i < 64; i++) if (last_oam[i] != oam4[i]) { same = 0; break; }
+        if (!spr_valid || spr_chr_dirty || !same || memcmp(last_state, st, 4)) {
             VP(2, build_sprites());
-            memcpy(last_oam, nes_oam, 256); memcpy(last_state, st, 4); spr_valid = 1;
+            for (i = 0; i < 64; i++) last_oam[i] = oam4[i];
+            memcpy(last_state, st, 4); spr_valid = 1;
         }
     }
     else { for (i = 0; i < 7; i++) disp_sprite_off((UWORD)i); spr_valid = 0; }

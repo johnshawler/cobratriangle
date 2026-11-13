@@ -3,7 +3,7 @@
 #include "nes.h"
 
 uint8_t cpu_a, cpu_x, cpu_y, cpu_s = 0xfd, cpu_c, cpu_z = 1, cpu_n, cpu_v, cpu_i = 1, cpu_d;
-uint8_t nes_ram[0x800];
+uint8_t nes_ram[0x800] __attribute__((aligned(4)));
 const uint8_t *nes_prg, *nes_chr, *nes_prg_lo, *nes_prg_hi;
 uint8_t nes_bank, nes_mapper = 1, ax_reg;
 uint16_t nt_map[4];
@@ -11,7 +11,8 @@ uint8_t  nes_chr_ram[0x2000], chr_dirty_flag[512];
 uint16_t chr_dirty[512], chr_ndirty;
 uint16_t nes_fatal_pc; int nes_fatal_why;
 
-uint8_t nes_vram[0x800], nes_pal[32], nes_oam[256];
+uint8_t nes_vram[0x800], nes_pal[32];
+uint8_t nes_oam[256] __attribute__((aligned(4)));
 uint8_t ppu_ctrl, ppu_mask, ppu_fx, ppu_vbl;
 uint16_t ppu_t;
 uint16_t ppu_v;                                 /* also used by the 68k fast path in src/nes68k.s */
@@ -224,7 +225,8 @@ void nes_write_slow(uint16_t a, uint8_t v)
         if (a == 0x4014) {                      /* OAM DMA */
             uint16_t src = (uint16_t)(v << 8); int i;
             if (src < 0x2000 && ppu_oamaddr == 0)          /* the usual case: a whole RAM page */
-                memcpy(nes_oam, nes_ram + (src & 0x7ff), 256);
+            {   const uint32_t *s4 = (const uint32_t *)(nes_ram + (src & 0x7ff)); uint32_t *d4 = (uint32_t *)nes_oam; int k;
+                for (k = 0; k < 64; k += 4) { d4[k] = s4[k]; d4[k + 1] = s4[k + 1]; d4[k + 2] = s4[k + 2]; d4[k + 3] = s4[k + 3]; } }
             else
                 for (i = 0; i < 256; i++) nes_oam[(uint8_t)(ppu_oamaddr + i)] = nes_rd((uint16_t)(src + i));
         } else if (a == 0x4016) {

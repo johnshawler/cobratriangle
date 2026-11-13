@@ -838,3 +838,57 @@ _r2007: move.w  ccr,-(sp)
 .slow   move.w  (sp)+,ccr
         lea     $2007.w,a0
         bra     _io_rd
+
+; ---- _ntcopy: d7.w = count - 1, a1 = source bytes: as many writes to $2007 (hand-written routines).
+; Changes d0, d3, d4, d6, d7, a0, a1 and the flags.
+        xdef    _ntcopy
+_ntcopy:
+        move.l  a2,-(sp)
+        moveq   #1,d6
+        btst    #2,_ppu_ctrl
+        beq.s   .l
+        moveq   #32,d6
+.l      move.b  (a1)+,d4
+        move.w  _ppu_v,d3
+        and.w   #$3fff,d3
+        cmp.w   #$2000,d3
+        bcs.s   .gen
+        cmp.w   #$3f00,d3
+        bcc.s   .gen
+        move.w  d3,d0
+        lsr.w   #8,d0
+        lsr.w   #1,d0
+        and.w   #6,d0
+        lea     _nt_map,a0
+        and.w   #$3ff,d3
+        or.w    (a0,d0.w),d3
+        lea     _nes_vram,a0
+        cmp.b   (a0,d3.w),d4
+        beq.s   .inc
+        move.b  d4,(a0,d3.w)
+        lea     _nes_dirty_flag,a0
+        tst.b   (a0,d3.w)
+        bne.s   .inc
+        cmp.w   #1024,_nes_ndirty
+        bcs.s   .mk
+        move.b  #1,_nes_redraw_all
+        bra.s   .inc
+.mk     move.b  #1,(a0,d3.w)
+        lea     _nes_dirty,a2
+        adda.w  _nes_ndirty,a2
+        adda.w  _nes_ndirty,a2
+        move.w  d3,(a2)
+        addq.w  #1,_nes_ndirty
+.inc    add.w   d6,_ppu_v
+        dbf     d7,.l
+        move.l  (sp)+,a2
+        rts
+.gen    move.w  ccr,-(sp)               ; not the nametable: the general helper (it pops the flags)
+        movem.l d6-d7/a1,-(sp)
+        move.w  12(sp),-(sp)
+        bsr     _w2007
+        movem.l (sp)+,d6-d7/a1
+        addq.l  #2,sp
+        dbf     d7,.l
+        move.l  (sp)+,a2
+        rts

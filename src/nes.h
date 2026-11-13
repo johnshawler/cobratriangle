@@ -10,7 +10,7 @@
 extern uint8_t cpu_a, cpu_x, cpu_y, cpu_s, cpu_c, cpu_z, cpu_n, cpu_v, cpu_i, cpu_d;
 
 /* ---- memory ---- */
-extern uint8_t nes_ram[0x800];
+extern uint8_t nes_ram[0x800];          /* (aligned to 4: copied a long at a time) */
 extern const uint8_t *nes_prg;          /* whole PRG ROM, 8 x 16 KB */
 extern const uint8_t *nes_chr;          /* whole CHR ROM, 128 KB = 32 banks of 4 KB */
 extern const uint8_t *nes_prg_lo;       /* the 16 KB bank mapped at $8000 */
