@@ -11,6 +11,7 @@
 ;       _cpu_x,_cpu_y,_cpu_s,_cpu_c,_cpu_z,_cpu_n,_cpu_v,_cpu_i,_cpu_d
         xref    _nes_ram,_nes_prg_lo,_nes_prg_hi,_nes_prg_data,_ppu_v,_ppu_ctrl,_nes_vram,_nes_dirty,_nes_dirty_flag,_nes_ndirty,_nes_redraw_all,_nes_bank,_mmc_shift,_mmc_chr0,_mmc_chr1,_mmc_ctrl,_mmc_prg,_pad_shift,_pad_strobe,_nes_pad
         xref    _nes_io_read,_nes_read_s0,_nes_write_slow,_nes_wait,_nes_fatal,_nes_mmc_prg,_nes_mmc_ctrl
+        xref    _ppu_w,_ppu_oamaddr,_ppu_rdbuf,_ppu_t,_ppu_fx,_ppu_mask,_nes_oam
         xref    _nes_idle,_nes_mapper,_ax_reg,_nt_map,_nes_chr_ram,_chr_dirty_flag,_chr_dirty,_chr_ndirty,_nes_prg_hi
 
 ; ---- moving the 6502 state between the globals and the registers
@@ -193,6 +194,47 @@ _wait:  bsr     _store_state
 ; ---- memory that is not plain RAM or ROM. All keep d0-d3, d5-d7, a0-a6 and the flags.
 _io_rd:                                 ; a0 = address -> d4
         move.w  ccr,-(sp)
+        cmpa.w  #$4017,a0               ; second controller: nothing there
+        bne.s   .r7
+        moveq   #$40,d4
+        move.w  (sp)+,ccr
+        rts
+.r7     cmpa.w  #$2007,a0               ; PPU data: nametable and CHR RAM reads, as vram_read() does them
+        bne     .r16
+        move.w  _ppu_v,d3
+        and.w   #$3fff,d3
+        cmp.w   #$3f00,d3
+        bcc     .slow
+        movem.l d0/a1,-(sp)
+        cmp.w   #$2000,d3
+        bcc.s   .rnt
+        cmp.b   #7,_nes_mapper
+        bne.s   .rslow
+        lea     _nes_chr_ram,a1
+        move.b  (a1,d3.w),d0
+        bra.s   .rgot
+.rnt    move.w  d3,d0
+        rol.w   #6,d0
+        and.w   #3,d0
+        add.w   d0,d0
+        lea     _nt_map,a1
+        and.w   #$3ff,d3
+        or.w    (a1,d0.w),d3
+        lea     _nes_vram,a1
+        move.b  (a1,d3.w),d0
+.rgot   move.b  _ppu_rdbuf,d4
+        move.b  d0,_ppu_rdbuf
+        moveq   #1,d3
+        btst    #2,_ppu_ctrl
+        beq.s   .ri
+        moveq   #32,d3
+.ri     add.w   d3,_ppu_v
+        movem.l (sp)+,d0/a1
+        move.w  (sp)+,ccr
+        rts
+.rslow  movem.l (sp)+,d0/a1
+        bra.s   .slow
+.r16
         cmpa.w  #$4016,a0               ; the controller: done here, as nes_io_read() does it
         bne.s   .slow
         move.b  _pad_shift,d4
@@ -337,7 +379,73 @@ _io_wr: cmpa.w  #$2007,a0               ; PPU data port: nametable and CHR RAM w
         move.w  d3,(a0,d0.w)
         addq.w  #1,_chr_ndirty
         bra.s   .inc
-.nt9    cmpa.l  #$8000,a0               ; MMC1: four of the five serial writes only shift
+.nt9    cmpa.w  #$2007,a0               ; the other PPU registers, as nes_write_slow() does them
+        bcc     .nt10
+        cmpa.w  #$2000,a0
+        bcs     .nt10
+        move.w  a0,d3
+        sub.w   #$2000,d3
+        add.w   d3,d3
+        move.w  .ppu(pc,d3.w),d3
+        jmp     .ppu(pc,d3.w)
+.ppu    dc.w    .w0-.ppu,.w1-.ppu,.call-.ppu,.w3-.ppu,.w4-.ppu,.w5-.ppu,.w6-.ppu
+.w0     move.b  d4,_ppu_ctrl
+        move.w  _ppu_t,d3
+        and.w   #$f3ff,d3
+        and.w   #3,d4
+        lsl.w   #8,d4
+        lsl.w   #2,d4
+        or.w    d4,d3
+        move.w  d3,_ppu_t
+        bra     .done
+.w1     move.b  d4,_ppu_mask
+        bra     .done
+.w3     move.b  d4,_ppu_oamaddr
+        bra     .done
+.w4     moveq   #0,d3
+        move.b  _ppu_oamaddr,d3
+        lea     _nes_oam,a0
+        move.b  d4,(a0,d3.w)
+        addq.b  #1,_ppu_oamaddr
+        bra     .done
+.w5     move.w  _ppu_t,d3
+        tst.b   _ppu_w
+        bne.s   .w5b
+        move.b  d4,d0
+        and.b   #7,d0
+        move.b  d0,_ppu_fx
+        and.w   #$ffe0,d3
+        lsr.b   #3,d4
+        or.w    d4,d3
+        bra.s   .w5c
+.w5b    and.w   #$8c1f,d3
+        move.w  d4,d0
+        and.w   #7,d0
+        ror.w   #4,d0                   ; << 12
+        or.w    d0,d3
+        and.w   #$f8,d4
+        lsl.w   #2,d4
+        or.w    d4,d3
+.w5c    move.w  d3,_ppu_t
+        eori.b  #1,_ppu_w
+        bra     .done
+.w6     move.w  _ppu_t,d3
+        tst.b   _ppu_w
+        bne.s   .w6b
+        and.w   #$00ff,d3
+        and.w   #$3f,d4
+        lsl.w   #8,d4
+        or.w    d4,d3
+        move.w  d3,_ppu_t
+        eori.b  #1,_ppu_w
+        bra     .done
+.w6b    and.w   #$ff00,d3
+        or.b    d4,d3
+        move.w  d3,_ppu_t
+        move.w  d3,_ppu_v
+        eori.b  #1,_ppu_w
+        bra     .done
+.nt10   cmpa.l  #$8000,a0               ; MMC1: four of the five serial writes only shift
         bcs     .pad
         cmp.b   #7,_nes_mapper
         beq     .ax

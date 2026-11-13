@@ -117,6 +117,7 @@ static int col_visible(LONG uc) { LONG x = uc * 8; return x + 8 > cam_ux + ((mas
 
 /* rowcopies[r]: bit 0 = the copy at y = 8r is up to date, bit 1 = the copy at y = 8r + 240 */
 static UBYTE rowcopies[30];
+static UBYTE tused[256];                /* background tiles drawn since the last full redraw (CHR RAM changes) */
 static UBYTE row_need(int r, int sy)
 {
     int y0 = 8 * r, y1 = 8 * r + 240;
@@ -148,6 +149,7 @@ static void draw_tile_copies(LONG uc, int r, UBYTE copies)
         if (copies & 2) blank8(d + 240 * 64);
         return;
     }
+    tused[tile] = 1;
     if (copies & 1) tile8(d, bg_chr(tile), (ULONG)(p3 << 8 | p2));
     if (copies & 2) tile8(d + 240 * 64, bg_chr(tile), (ULONG)(p3 << 8 | p2));
 }
@@ -159,7 +161,7 @@ static void want_cols(LONG *lo, LONG *hi)
     *hi = (cam_ux - VIEW_X + 320 + 8) >> 3;
 }
 
-static void invalidate(void) { col_lo = 1; col_hi = 0; work_row = -1; }
+static void invalidate(void) { col_lo = 1; col_hi = 0; work_row = -1; memset(tused, 0, sizeof tused); }
 
 /* make every row's copies match what the scroll position sy shows */
 static void sync_rows(int sy)
@@ -240,6 +242,7 @@ static void redraw_tile(UBYTE t)
 {
     int i;
     const UBYTE *v = nes_vram + pf_page;
+    if (!tused[t]) return;                              /* not on screen: nothing to redraw */
     for (i = 0; i < 960; i++) if (v[i] == t) redraw_cell((UWORD)(pf_page | i));
 }
 
@@ -247,6 +250,7 @@ static void redraw_tile(UBYTE t)
 static UBYTE *bar_bm;                   /* chip RAM: 4 planes x BAR_LINES x BAR_ROWB; line k = NES line pf_h + k */
 #define BAR_PLANE ((ULONG)BAR_LINES * BAR_ROWB)
 static UWORD bar_page;
+static UBYTE bar_tused[256];            /* tiles the bar bitmap shows */
 static int bar_valid, bar_drawn_h;
 static LONG bar_x = -1; static int bar_y = -1, bar_h;
 
@@ -256,12 +260,14 @@ static void render_bar(void)
     int r, c, k, p, top = pf_h;
     UBYTE *b;
     for (p = 0; p < 4; p++) memset(bar_bm + p * BAR_PLANE, p == 2 ? 0xff : 0, BAR_PLANE);
+    memset(bar_tused, 0, sizeof bar_tused);
     for (r = 0; r < 8; r++)
         for (c = 0; c < 32; c++) {
             UWORD cell = (UWORD)(bar_page | (r << 5) | c);
             UBYTE attr = nes_vram[bar_page | 0x3c0 | ((r >> 2) << 3) | (c >> 2)];
             UBYTE pal = (UBYTE)((attr >> (((r & 2) << 1) | (c & 2))) & 3);
             const UBYTE *chr = bg_chr(nes_vram[cell]);
+            bar_tused[nes_vram[cell]] = 1;
             for (k = 0; k < 8; k++) {
                 int line = BAR_V_LINE + r * 8 + k - top;          /* bitmap line of NES line BAR_V_LINE + 8r + k */
                 UBYTE p0 = chr[k], p1 = chr[k + 8], m = (UBYTE)(p0 | p1);
@@ -446,6 +452,14 @@ typedef struct { ULONG sig; UWORD n; UBYTE *e, *o; } Cached;
 static Cached cache[2][64];
 static int ncache[2];
 
+static UBYTE spr_tchg[256];             /* sprite tiles the game rewrote this frame */
+static int group_changed(Group *g)
+{
+    int k;
+    for (k = 0; k < g->n; k++) if (spr_tchg[nes_oam[g->idx[k] * 4 + 1]]) return 1;
+    return 0;
+}
+
 static ULONG group_sig(Group *g, int with_o)
 {
     ULONG h = (ULONG)g->n * 0x9e3779b1UL ^ (ULONG)(g->y1 - g->y0) ^ ((ULONG)with_o << 31);
@@ -504,7 +518,8 @@ static void build_sprites(void)
         put_ctl((UWORD)g->se, e, g, 0);
         if (o) put_ctl((UWORD)g->so, o, g, 1);
         sig = group_sig(g, o != 0);
-        for (j = 0; j < ncache[spr_set ^ 1]; j++) if (cp[j].sig == sig && cp[j].n == n) { hit = &cp[j]; break; }
+        if (!group_changed(g))
+            for (j = 0; j < ncache[spr_set ^ 1]; j++) if (cp[j].sig == sig && cp[j].n == n) { hit = &cp[j]; break; }
         if (hit) {
             copy_lines(e + 16, hit->e, n);
             if (o) copy_lines(o + 16, hit->o, n);
@@ -598,11 +613,11 @@ void video_frame(void)
         UWORD tl = chr_dirty[i];
         chr_dirty_flag[tl] = 0;
         if ((tl >> 8) == bgsel) {
-            bar_dirty = 1;
+            if (bar_tused[tl & 255]) bar_dirty = 1;
             if (chr_ndirty > 12) { if (col_lo <= col_hi) invalidate(); }   /* a new tile set: draw everything again */
             else if (col_lo <= col_hi) redraw_tile((UBYTE)tl);
         }
-        if ((tl >> 8) == ((ppu_ctrl >> 3) & 1)) spr_chr_dirty = 1;
+        if ((tl >> 8) == ((ppu_ctrl >> 3) & 1)) { spr_chr_dirty = 1; spr_tchg[tl & 255] = 1; }
     }
     chr_ndirty = 0;
 
@@ -635,11 +650,11 @@ void video_frame(void)
         static UBYTE last_oam[256], last_state[4];
         UBYTE st[4];
         st[0] = ppu_ctrl; st[1] = (UBYTE)split; st[2] = (UBYTE)pf_h; st[3] = 0;
-        if (spr_chr_dirty) { ncache[0] = ncache[1] = 0; }
         if (!spr_valid || spr_chr_dirty || memcmp(last_oam, nes_oam, 256) || memcmp(last_state, st, 4)) {
             VP(2, build_sprites());
             memcpy(last_oam, nes_oam, 256); memcpy(last_state, st, 4); spr_valid = 1;
         }
+        if (spr_chr_dirty) memset(spr_tchg, 0, sizeof spr_tchg);
     }
     else { for (i = 0; i < 7; i++) disp_sprite_off((UWORD)i); spr_valid = 0; }
 }
