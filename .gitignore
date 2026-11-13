@@ -1,0 +1,20 @@
+# build and bench output
+dist/*
+!dist/.gitkeep
+bench.txt
+bench_fast.txt
+shot.png
+shot_fast.png
+*.o
+out/
+__pycache__/
+*.pyc
+*_host
+frame_*.ppm
+# copyrighted inputs and everything derived from them: never published (this repository is public)
+original/*.nes
+*.rom
+assets/*
+!assets/.gitkeep
+src/gen_*
+src/gen68k.s
