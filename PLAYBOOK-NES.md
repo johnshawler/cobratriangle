@@ -16,7 +16,8 @@ resets the per-game files and keeps everything reusable. The Claude skill in `sk
 | --- | --- | --- |
 | Generic 6502 | `tools/op6502.py`, `tools/dis.py`, `tools/recomp.py`, `tools/back68k.py`, `tools/nesref/verify.c`, `src/coro*.{s,c,h}`, `src/run*.{c,h}`, `src/nes68k.s` (helpers), `src/logic.c` frame model | use as is |
 | NES machine | `tools/nesref/nesref.c` (reference NES), `src/nes.{c,h}` (PPU/APU/pad state), `src/video.{c,h}` + `src/video68k.s` (PPU → AGA), `src/sound.{c,h}` (APU → Paula), `tools/vhost.c`, `tools/shost.c` | use; extend for what the game uses |
-| Mapper | MMC1 in `nesref.c`, `nes.c`, and the fast paths in `nes68k.s` (`_set_prg`, `_io_wr`) | add the new mapper in all three |
+| Mapper | MMC1 and AxROM (mapper 7) in `nesref.c`, `nes.c`, `recomp.py`/`back68k.py` (bank model) and the fast paths in `nes68k.s` (`_set_prg`, `_io_wr` `.ax`) | add the new mapper in all of them |
+| CHR RAM | `nes.c` keeps `nes_chr_ram` and a dirty-tile list; `nes68k.s` writes it in the `$2007` fast path; `video.c` redraws cells/sprites using a changed tile | use as is |
 | Per game | `tools/games/<game>.py` (NORETURN, hand-written routines), `game_bench_input` in `src/logic.c`, the flow traces in `tools/flow/`, `tools/make_assets.sh` (ROM check), `original/README.md` | write new |
 | Starting a port | `tools/new_port.sh`, `skills/amiga-nes-port/SKILL.md` | run once / install once |
 | Debugging | `tools/debug_run.sh`, `tools/shot_at.sh`, `src/prof68k.s` (1 kHz profiler), `LOGIC_TRACE`/`LOGIC_NOSUM`/`LOGIC_DUMP`/`HOLD_AT` builds | use as is |
@@ -43,6 +44,17 @@ resets the per-game files and keeps everything reusable. The Claude skill in `sk
   changes after it belongs to the lower part of the picture.
 - **Stack tricks** (jump tables after JSR, `PLA PLA RTS`, pushed-address RTS): the 6502 stack stays in RAM,
   RTS compares with the caller's expectation and unwinds. Jump-table dispatchers go in `NORETURN`.
+- **NMI-driven games** (main thread `JMP *` or `BNE *`, the NMI does the frame and resets the stack with `TXS`):
+  recomp.py marks a jump/branch to itself as an `IDLE` wait; `nes_idle()` in `logic.c` longjmps back to
+  `nes_main`, which pushes the idle address and runs the NMI vector of the mapped bank. `verify.c` does the same.
+- **Mid-frame split without a sprite-0 BVC**: `LDA #$40; BIT $2002; BEQ` is also a sprite-0 wait (recomp.py looks
+  at the `LDA #` before the loop). Cycle-timed delay loops after it (`DEX/BNE`) are replaced by hand (HLE) with
+  their end state; record what the split changes (scroll, page, PPUMASK, backdrop: `split_*` in `nes.c`).
+- **AxROM bank switches** swap all of $8000-$FFFF under the running code: the translated function ends at the
+  store and dispatches the next address in the new bank; continuations come from `LDA #n` before the store,
+  from code identical in all banks, and from the traces (`B` lines of `nesref -c`). After a JSR to a function
+  that may switch, the caller checks its bank (`cmpa.l #bank,a3`) and dispatches if it changed.
+- **PAL games** (NES 2.0 header byte 12): `nesref` runs 312-line frames; `TICKS_PER_SECOND` 50 in `main.c`.
 - **Lag**: check with the reference whether the original finishes its logic within each frame in the busy
   scenes. If it doesn't, game time on the NES is slower there and the frame model would need cycle budgets
   (not needed for Little League Baseball).
@@ -94,15 +106,20 @@ Say the verdict in the report from the start; name the upgrade.
 - Background: 4 planes = 16 NES colours (attribute bits as planes 2–3), hardware scroll over an unwrapped world,
   stream tile columns, each tile row at y and y+240 drawing only the shown copy, border columns blank, honour
   PPUMASK's hidden left column. Tile-set-only splits: draw rows with the right tile set.
-- Sprites: cluster ≤ 64 px, 64-pixel attached pairs (15 colours), reuse channels down the screen, cache unchanged
-  clusters from the previous sprite set. Sprite-behind-background priority is not done yet.
+- Sprites: cluster ≤ 64 px; a cluster in one NES palette p goes alone into sprite 2p or 2p+1 (the Amiga sprite
+  colour groups are the NES sprite palettes), mixed clusters into 64-pixel attached pairs (15 colours); reuse
+  every sprite down the screen, cache unchanged clusters from the previous sprite set. Seven channels instead of
+  four cut dropped clusters from 1,233 to 214 in Cobra Triangle. Sprite-behind-background priority is not done yet.
+- Backdrop colours that differ above and below a split: draw tiles with the attribute planes masked by the
+  pixels (colour 0 stays 0), then colours 4/8/12 are free for the other part's backdrop.
 - Sound: APU model (length, envelope, sweep, linear counter, 240 Hz sequencer) → Paula periods and volumes with
   looped one-period waveforms. DMC not done yet.
 - Develop both on the host harnesses (`tools/vhost.c`, `tools/shost.c`), then confirm on the emulator.
 
 ## 8. Not done yet (do it when a game needs it)
 
-Other mappers (UxROM, CNROM, MMC3 with its scanline IRQ); scroll changes at a split; sprite-behind-background;
+Other mappers (UxROM, CNROM, MMC3 with its scanline IRQ); scroll changes at a split in general (Cobra
+Triangle's bottom status bar is blitted under the view: `video.c` `bar_frame`); sprite-behind-background;
 DMC samples; 8×16 sprites in `video.c` (the reference handles them); lag (cycle budgets); a 68030 bench.
 
 ## 9. Lessons log (append one entry per port, newest last)
