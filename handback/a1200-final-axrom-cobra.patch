@@ -1,4 +1,4 @@
-From a0317a11b3d43e9eca1caa4dec134f3b0ce2e932 Mon Sep 17 00:00:00 2001
+From ecfd41088beb9c35b66fe578c348eb0e20f98389 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Fri, 13 Nov 2026 12:30:04 +0000
 Subject: [PATCH] Bring back the Cobra Triangle port's tools and lessons:
@@ -22,44 +22,46 @@ Not re-run against Little League Baseball here (no ROM in this session).
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01VAWMaBP4BJTmyD7VnDCuPj
 ---
- PLAYBOOK-NES.md                  |  40 ++++++-
- history/cobra/LEARNINGS.md       |  70 ++++++++++++
- history/cobra/NOTES.md           |  12 ++
- history/cobra/PIPELINE.md        |  56 ++++++++++
- history/cobra/REPORT.txt         |  33 ++++++
- history/cobra/original-README.md |  37 +++++++
- src/host_test.c                  |  16 ++-
- src/logic.c                      |  66 ++++++++++-
+ PLAYBOOK-NES.md                  |  50 ++-
+ history/cobra/LEARNINGS.md       |  89 +++++
+ history/cobra/NOTES.md           |  12 +
+ history/cobra/PIPELINE.md        |  56 ++++
+ history/cobra/REPORT.txt         |  35 ++
+ history/cobra/original-README.md |  37 +++
+ src/host_test.c                  |  16 +-
+ src/logic.c                      |  66 +++-
  src/logic.h                      |   1 +
- src/nes.c                        |  65 ++++++++---
- src/nes.h                        |  17 ++-
- src/nes68k.s                     | 185 +++++++++++++++++++++++++++++--
+ src/nes.c                        |  73 +++--
+ src/nes.h                        |  19 +-
+ src/nes68k.s                     | 542 ++++++++++++++++++++++++++++++-
  src/run68k.c                     |   2 +-
  src/run_c.c                      |   2 +-
- src/video68k.s                   |  21 ++--
- tools/back68k.py                 |  26 ++++-
- tools/cmp_trace.py               |  10 ++
+ src/video68k.s                   |  21 +-
+ tools/back68k.py                 |  83 ++++-
+ tools/cmp_trace.py               |  10 +
  tools/debug_run.sh               |   8 +-
- tools/games/cobra.py             |  76 +++++++++++++
+ tools/framestat.py               |  20 ++
+ tools/games/cobra.py             | 100 ++++++
  tools/make_assets.sh             |   7 +-
- tools/nesref/nesref.c            |  54 ++++++---
- tools/nesref/verify.c            |  27 +++--
- tools/prof.py                    |  52 +++++++++
- tools/recomp.py                  | 136 +++++++++++++++++++----
+ tools/nesref/nesref.c            |  54 ++-
+ tools/nesref/verify.c            |  27 +-
+ tools/prof.py                    |  63 ++++
+ tools/recomp.py                  | 136 ++++++--
  tools/shot_at.sh                 |   6 +-
- tools/vhost.c                    |  34 ++++--
- 26 files changed, 944 insertions(+), 115 deletions(-)
+ tools/vhost.c                    |  34 +-
+ 27 files changed, 1445 insertions(+), 124 deletions(-)
  create mode 100644 history/cobra/LEARNINGS.md
  create mode 100644 history/cobra/NOTES.md
  create mode 100644 history/cobra/PIPELINE.md
  create mode 100644 history/cobra/REPORT.txt
  create mode 100644 history/cobra/original-README.md
  create mode 100644 tools/cmp_trace.py
+ create mode 100644 tools/framestat.py
  create mode 100644 tools/games/cobra.py
  create mode 100644 tools/prof.py
 
 diff --git a/PLAYBOOK-NES.md b/PLAYBOOK-NES.md
-index 416e112..27affd7 100644
+index 416e112..c4c5179 100644
 --- a/PLAYBOOK-NES.md
 +++ b/PLAYBOOK-NES.md
 @@ -16,7 +16,8 @@ resets the per-game files and keeps everything reusable. The Claude skill in `sk
@@ -90,7 +92,23 @@ index 416e112..27affd7 100644
  - **Lag**: check with the reference whether the original finishes its logic within each frame in the busy
    scenes. If it doesn't, game time on the NES is slower there and the frame model would need cycle budgets
    (not needed for Little League Baseball).
-@@ -94,15 +106,20 @@ Say the verdict in the report from the start; name the upgrade.
+@@ -65,6 +77,15 @@ Found in the first port; look for them in every game with the profiler (`src/pro
+ Hand-written routines: guard them (fall back to `.orig`), reproduce registers, all four flags, RAM and the
+ return addresses left on the stack page, and prove them with the per-tick checksum.
+ 
++## 4b. Frame time: work on the worst frame, not the average
++
++The kit's loop runs every tick due before drawing. Once one frame needs two vblanks, the next runs two ticks
++and (if logic + logic + display > 71k) stays at 25 Hz however cheap the average frame is. Measure the
++distribution of one tick + one picture (`tools/framestat.py` on a `tools/debug_run.sh` build with `-DNOVP`) and cut
++the bursts (nametable rewrites, tile-set uploads, sprite-cache misses) as much as the median. On fast RAM every
++68k instruction costs ~3-4 colour clocks: count instructions; per-register I/O helpers, a pointer cache for
++`(zp),Y`, and caches keyed by content (CHR RAM tile hashes) were the wins.
++
+ ## 5. Translator rules of thumb
+ 
+ - 68k back end, not C, on the Amiga (C costs 3× more: registers through globals at every call).
+@@ -94,15 +115,20 @@ Say the verdict in the report from the start; name the upgrade.
  - Background: 4 planes = 16 NES colours (attribute bits as planes 2–3), hardware scroll over an unwrapped world,
    stream tile columns, each tile row at y and y+240 drawing only the shown copy, border columns blank, honour
    PPUMASK's hidden left column. Tile-set-only splits: draw rows with the right tile set.
@@ -114,7 +132,7 @@ index 416e112..27affd7 100644
  DMC samples; 8×16 sprites in `video.c` (the reference handles them); lag (cycle budgets); a 68030 bench.
  
  ## 9. Lessons log (append one entry per port, newest last)
-@@ -118,3 +135,18 @@ sections above if a lesson is general.
+@@ -118,3 +144,19 @@ sections above if a lesson is general.
  - Biggest wins were I/O plumbing found by the profiler (OAM DMA, controller, MMC1, PPU writes), not game logic.
  - Next time: measure the load on day one (it decided the outcome); build the 1 kHz profiler before optimising
    anything; don't trust static cost estimates; write the display on the host harness first.
@@ -123,7 +141,8 @@ index 416e112..27affd7 100644
 +
 +- Load: 7,450 average, 8,700 max 6502 instructions per frame in play (no demo mode: scripted play from START);
 +  title screens 500-1,900. PAL, so one tick per Amiga frame.
-+- Result: checksum equal on both machines over 3,000 ticks; 13.8 fps stock, 21.9 fps with 4 MB fast RAM.
++- Result: checksum equal on both machines over 3,000 ticks; 18.1 fps stock, 30.5 fps with 4 or 8 MB fast RAM
++  (first build 11.5 / 17.4).
 +  Fast RAM: logic ~53k colour clocks a tick, display ~80k a frame (51 NES sprites on screen).
 +- New: AxROM bank model in the translator, NMI-driven idle-loop frame model, CHR RAM, PAL reference timing, a
 +  status bar split shown by blitting the bar under the view, 7-channel sprite allocation, `tools/prof.py`.
@@ -135,10 +154,10 @@ index 416e112..27affd7 100644
 +  run short emulator benches (bench.sh's time limit makes a slow port look crashed).
 diff --git a/history/cobra/LEARNINGS.md b/history/cobra/LEARNINGS.md
 new file mode 100644
-index 0000000..88dbcbd
+index 0000000..b651ef2
 --- /dev/null
 +++ b/history/cobra/LEARNINGS.md
-@@ -0,0 +1,70 @@
+@@ -0,0 +1,89 @@
 +# Learnings from porting Cobra Triangle (NES, PAL, AxROM) to the A1200
 +
 +The second NES port with this template (the first, Little League Baseball, is in history/llb/). General lessons
@@ -198,10 +217,29 @@ index 0000000..88dbcbd
 +21.9; display: no nametable scan for unseen tiles, the bar re-rendered only when its own tiles change,
 +sprite cache invalidated per tile instead of entirely.
 +
++## 3b. The second round: 22.9 -> 30.5 fps on fast RAM (stock 14.1 -> 18.1)
++
++| Change | Effect |
++| --- | --- |
++| Lean helper per PPU register and the bank register (no address tests, no register saves) | 22.9 -> 26.0 fps |
++| Status bar: per-cell updates of its bitmap, queued blits, per-line validity of the row it cuts | display 70k -> 53k |
++| Sprite cluster pool in fast RAM (1 MB), signatures from tile *content* hashes (CHR RAM animation hits) | hits 74% -> 88%, 26.6 -> 28.3 |
++| Grouping first pass in assembly; JMP (ind) caches; (zp),Y pointer cache in a6; column copy by hand | +1.5 fps |
++| 32-pixel hardware sprites (half the chip copies; a few more dropped clusters) | +0.3 fps |
++
++**The kit loop locks at 25 Hz.** In play 70% of frames could show one tick plus a picture inside 71k
++(median 66k), but one frame over makes the next run two ticks (~66k logic + display ~98k), which never fits:
++the loop stays at two vblanks a frame with ~44k idle each. Average cost hardly moves the frame rate until the
++*worst* single-tick frame fits; work on the tail (bursts), not the mean. `tools/framestat.py` shows it.
++
++What did not help: moving the sprite cache from chip to fast RAM alone, power-of-two array strides, skipping
++unchanged sprite-list slots (half the copies were already skippable); 4 vs 8 MB fast RAM (identical).
++Profiler pitfall: a timer call per small item (per cell, per cluster) costs more than the item; time blocks.
++
 +## 4. What to try next (fast RAM, play)
 +
-+1. Sprites: 51 visible NES sprites a frame; clustering and rendering in C cost ~40k. Grouping in assembly and
-+   keeping clusters across frames (the scenery moves with the scroll) are the next big display item.
++1. The tail: 90th percentile one tick + picture is 82k (needs < 71k for 50 Hz, < 57k for the gate). Sprites
++   ~27k a frame (per-cluster work in C ~18k: control words, signatures, chip copies, misses), logic 33k.
 +2. The straddling tile row under the bar is redrawn every frame the view moves (~40 tiles): draw only the lines
 +   above the bar, or move the bar blit to the tile boundary.
 +3. Logic: profile again restricted to play; `(zp),y` reads through `_rd_ea` (the decompressor at bank 1 $8430
@@ -291,32 +329,34 @@ index 0000000..a0c5a78
 +| 7 | Stock A1200 at 50 Hz | not reachable by translation (7,450+ 6502 instructions a frame) | - | - |
 diff --git a/history/cobra/REPORT.txt b/history/cobra/REPORT.txt
 new file mode 100644
-index 0000000..1c94674
+index 0000000..a6d0194
 --- /dev/null
 +++ b/history/cobra/REPORT.txt
-@@ -0,0 +1,33 @@
+@@ -0,0 +1,35 @@
 +PORT REPORT
 +Game:                  Cobra Triangle (Rare 1989), NES, European PAL release (mapper 7 AxROM, 128 KB PRG, CHR RAM)
 +Class and route:       Assembly/binary for a 6502 machine: translated once on the host (tools/recomp.py) to 68k
 +                       assembly (tools/back68k.py); NES video, sound and input replaced by src/video.c, src/sound.c,
 +                       src/nes.c and the kit
-+Display:               planes=4 scroll=1 fetch=0 buffers=1 sprites used=7 (0-6: 3 attached pairs or 6 singles + 6)
++Display:               planes=4 scroll=1 fetch=0 buffers=1 sprites used=7 (32 pixels wide; attached pairs or singles)
 +                       colours=16 playfield/status bar + 16 sprite (NES palettes)
 +Busiest moment:        play: 51 NES sprites on average, diagonal scrolling, status bar redrawn under the view.
 +                       Not a budget sum: the logic alone is ~96k colour clocks a tick on the stock machine
-+                       (135% of a frame) and ~53k on 4 MB fast RAM (74%); the display ~80-130k a frame
++                       (135% of a frame) and ~33k on 4 or 8 MB fast RAM (46%); the display ~33k a frame on
++                       fast RAM (median; sprites ~27k of it, 90th percentile 48k)
 +Cut from the original: cycle-timed raster effects (their result is shown: the status bar; their timing is not),
 +                       lag frames (the translated logic always finishes its frame; the NES lags about once in 750
 +                       play frames), DMC samples, sprite-behind-background priority, colour emphasis bits
-+Stock A1200 bench:     frames=996 late=2606 worst_cck=2636781 avg_cck=213348 budget_cck=71051 worst_pct=3711 avg_pct=300 display_hz=50 shown_fps=13.8
++Stock A1200 bench:     frames=1119 late=1963 worst_cck=1991037 avg_cck=147227 budget_cck=71051 worst_pct=2802 avg_pct=207 display_hz=50 shown_fps=18.1
 +                       ticks=3000 checksum=21a7571d  (FS-UAE 3.1.66, A1200 model, AROS ROM)
-+With 4 MB fast RAM:    frames=1342 late=1713 worst_cck=1671625 avg_cck=111312 budget_cck=71051 worst_pct=2352 avg_pct=156 display_hz=50 shown_fps=21.9
++With 4 MB fast RAM:    frames=1850 late=1181 worst_cck=1336425 avg_cck=65809 budget_cck=71051 worst_pct=1880 avg_pct=92 display_hz=50 shown_fps=30.5
 +                       ticks=3000 checksum=21a7571d
-+Kickstart 3.1 (40.68):  frames=998 late=2605 worst_cck=2636297 avg_cck=212858 budget_cck=71051 worst_pct=3710 avg_pct=299 display_hz=50 shown_fps=13.8
++With 8 MB fast RAM:    the same line (4 and 8 MB give identical results; the sprite cache uses 1 MB)
++Kickstart 3.1 (40.68):  (previous build, before the display work) frames=998 late=2605 worst_cck=2636297 avg_cck=212858 budget_cck=71051 worst_pct=3710 avg_pct=299 display_hz=50 shown_fps=13.8
 +                       ticks=3000 checksum=21a7571d  (the user's Commodore ROM via --kickstart_file, stock A1200;
 +                       takeover and return to the AmigaDOS shell checked on a screenshot)
 +Host checksum:         21a7571d after 3000 ticks  equal (stock and fast RAM)
-+Frame rate claim:      13.8 fps shown on the stock A1200, 21.9 fps with 4 MB fast RAM, logic at 50 ticks (game
++Frame rate claim:      18.1 fps shown on the stock A1200, 30.5 fps with 4 or 8 MB fast RAM, logic at 50 ticks (game
 +                       time exact). 50 Hz NOT held: tools/port.sh prints FAIL (late, worst_pct). The stock machine
 +                       cannot hold 50 Hz by translation (load measured on day one: 7,450-8,700 6502 instructions a
 +                       frame); the cheapest upgrade that might, with more hand-written routines, is fast RAM; a
@@ -572,12 +612,15 @@ index de6cfa6..cc077ac 100644
  extern uint8_t logic_extra_pad;                 /* NES buttons from the keyboard, ORed into every tick */
  extern uint32_t logic_frames;                   /* NES frames (NMIs) run so far */
 diff --git a/src/nes.c b/src/nes.c
-index a243cbc..33d418a 100644
+index a243cbc..5fc844f 100644
 --- a/src/nes.c
 +++ b/src/nes.c
-@@ -5,14 +5,18 @@
+@@ -3,16 +3,21 @@
+ #include "nes.h"
+ 
  uint8_t cpu_a, cpu_x, cpu_y, cpu_s = 0xfd, cpu_c, cpu_z = 1, cpu_n, cpu_v, cpu_i = 1, cpu_d;
- uint8_t nes_ram[0x800];
+-uint8_t nes_ram[0x800];
++uint8_t nes_ram[0x800] __attribute__((aligned(4)));
  const uint8_t *nes_prg, *nes_chr, *nes_prg_lo, *nes_prg_hi;
 -uint8_t nes_bank;
 +uint8_t nes_bank, nes_mapper = 1, ax_reg;
@@ -586,7 +629,9 @@ index a243cbc..33d418a 100644
 +uint16_t chr_dirty[512], chr_ndirty;
  uint16_t nes_fatal_pc; int nes_fatal_why;
  
- uint8_t nes_vram[0x800], nes_pal[32], nes_oam[256];
+-uint8_t nes_vram[0x800], nes_pal[32], nes_oam[256];
++uint8_t nes_vram[0x800], nes_pal[32];
++uint8_t nes_oam[256] __attribute__((aligned(4)));
  uint8_t ppu_ctrl, ppu_mask, ppu_fx, ppu_vbl;
  uint16_t ppu_t;
  uint16_t ppu_v;                                 /* also used by the 68k fast path in src/nes68k.s */
@@ -596,7 +641,7 @@ index a243cbc..33d418a 100644
  uint8_t mmc_ctrl = 0x0c, mmc_chr0, mmc_chr1, mmc_prg;
  uint8_t mmc_shift = 0x10;                       /* also used by the 68k fast paths in src/nes68k.s */
  
-@@ -21,6 +25,7 @@ uint16_t nes_ndirty;
+@@ -21,6 +26,7 @@ uint16_t nes_ndirty;
  uint8_t  nes_dirty_flag[0x800];
  uint8_t  nes_redraw_all = 1, nes_pal_dirty = 1;
  
@@ -604,7 +649,7 @@ index a243cbc..33d418a 100644
  uint8_t  split_on, split_ctrl, split_chr0, split_chr1, split_fx, split_line, split_seen;
  uint16_t split_t;
  
-@@ -28,8 +33,29 @@ uint8_t apu_reg[0x18], apu_trig;
+@@ -28,8 +34,29 @@ uint8_t apu_reg[0x18], apu_trig;
  uint8_t nes_pad;
  uint8_t pad_shift, pad_strobe;                 /* also used by src/nes68k.s */
  
@@ -634,7 +679,7 @@ index a243cbc..33d418a 100644
      int mode = (mmc_ctrl >> 2) & 3, b = mmc_prg & 0x0f;
      int lo, hi;
      if (mode < 2) { lo = b & 0x0e; hi = lo | 1; }
-@@ -39,12 +65,15 @@ static void map_prg(void)
+@@ -39,12 +66,15 @@ static void map_prg(void)
      nes_bank = (uint8_t)lo;
      nes_prg_lo = nes_prg + lo * 0x4000;
      nes_prg_hi = nes_prg + hi * 0x4000;
@@ -652,7 +697,7 @@ index a243cbc..33d418a 100644
  }
  
  void nes_fatal(uint16_t pc, int why)
-@@ -55,13 +84,7 @@ void nes_fatal(uint16_t pc, int why)
+@@ -55,13 +85,7 @@ void nes_fatal(uint16_t pc, int why)
  /* index into nes_vram for a PPU address $2000-$2FFF, after mirroring */
  static uint16_t nt_index(uint16_t a)
  {
@@ -667,7 +712,7 @@ index a243cbc..33d418a 100644
  }
  
  static void mark(uint16_t i)
-@@ -83,7 +106,13 @@ static void vram_write(uint8_t v)
+@@ -83,7 +107,13 @@ static void vram_write(uint8_t v)
      } else if (a >= 0x2000) {
          uint16_t i = nt_index(a);
          if (nes_vram[i] != v) { nes_vram[i] = v; mark(i); }
@@ -682,7 +727,7 @@ index a243cbc..33d418a 100644
      ppu_v += (ppu_ctrl & 4) ? 32 : 1;
  }
  
-@@ -93,7 +122,7 @@ static uint8_t vram_read(void)
+@@ -93,7 +123,7 @@ static uint8_t vram_read(void)
      uint8_t r = ppu_rdbuf, d;
      if (a < 0x2000) {
          uint16_t bank = (mmc_ctrl & 0x10) ? ((a < 0x1000) ? mmc_chr0 : mmc_chr1) : ((mmc_chr0 & 0x1e) | (a >> 12));
@@ -691,7 +736,7 @@ index a243cbc..33d418a 100644
      } else d = nes_vram[nt_index(a)];
      if (a >= 0x3f00) { uint16_t p = a & 0x1f; if ((p & 0x13) == 0x10) p &= 0x0f; r = nes_pal[p]; }
      ppu_rdbuf = d;
-@@ -129,7 +158,7 @@ uint8_t nes_read_s0(void)
+@@ -129,7 +159,7 @@ uint8_t nes_read_s0(void)
      if (ppu_s0) {
          split_seen = 1;
          split_ctrl = ppu_ctrl; split_chr0 = mmc_chr0; split_chr1 = mmc_chr1; split_t = ppu_t; split_fx = ppu_fx;
@@ -700,7 +745,7 @@ index a243cbc..33d418a 100644
      }
      ppu_vbl = 0; ppu_w = 0; ppu_s0 ^= 1;
      return r;
-@@ -149,6 +178,7 @@ void nes_mmc_ctrl(uint8_t v)
+@@ -149,6 +179,7 @@ void nes_mmc_ctrl(uint8_t v)
      if ((v ^ mmc_ctrl) & 0x03) nes_redraw_all = 1;
      mmc_ctrl = v;
      map_prg();
@@ -708,7 +753,7 @@ index a243cbc..33d418a 100644
      mmc_shift = 0x10;
  }
  
-@@ -161,7 +191,7 @@ static void mmc1(uint16_t a, uint8_t v)
+@@ -161,7 +192,7 @@ static void mmc1(uint16_t a, uint8_t v)
          if (done) {
              uint8_t val = mmc_shift;
              switch ((a >> 13) & 3) {
@@ -717,7 +762,17 @@ index a243cbc..33d418a 100644
              case 1: mmc_chr0 = val; break;          /* tile sets: the display compares what it drew with */
              case 2: mmc_chr1 = val; break;
              default: mmc_prg = val; break;
-@@ -207,5 +237,8 @@ void nes_write_slow(uint16_t a, uint8_t v)
+@@ -194,7 +225,8 @@ void nes_write_slow(uint16_t a, uint8_t v)
+         if (a == 0x4014) {                      /* OAM DMA */
+             uint16_t src = (uint16_t)(v << 8); int i;
+             if (src < 0x2000 && ppu_oamaddr == 0)          /* the usual case: a whole RAM page */
+-                memcpy(nes_oam, nes_ram + (src & 0x7ff), 256);
++            {   const uint32_t *s4 = (const uint32_t *)(nes_ram + (src & 0x7ff)); uint32_t *d4 = (uint32_t *)nes_oam; int k;
++                for (k = 0; k < 64; k += 4) { d4[k] = s4[k]; d4[k + 1] = s4[k + 1]; d4[k + 2] = s4[k + 2]; d4[k + 3] = s4[k + 3]; } }
+             else
+                 for (i = 0; i < 256; i++) nes_oam[(uint8_t)(ppu_oamaddr + i)] = nes_rd((uint16_t)(src + i));
+         } else if (a == 0x4016) {
+@@ -207,5 +239,8 @@ void nes_write_slow(uint16_t a, uint8_t v)
          }
          return;
      }
@@ -728,10 +783,16 @@ index a243cbc..33d418a 100644
 +    }
  }
 diff --git a/src/nes.h b/src/nes.h
-index 06885ca..b6b481d 100644
+index 06885ca..bccd6e8 100644
 --- a/src/nes.h
 +++ b/src/nes.h
-@@ -15,14 +15,17 @@ extern const uint8_t *nes_prg;          /* whole PRG ROM, 8 x 16 KB */
+@@ -10,19 +10,22 @@
+ extern uint8_t cpu_a, cpu_x, cpu_y, cpu_s, cpu_c, cpu_z, cpu_n, cpu_v, cpu_i, cpu_d;
+ 
+ /* ---- memory ---- */
+-extern uint8_t nes_ram[0x800];
++extern uint8_t nes_ram[0x800];          /* (aligned to 4: copied a long at a time) */
+ extern const uint8_t *nes_prg;          /* whole PRG ROM, 8 x 16 KB */
  extern const uint8_t *nes_chr;          /* whole CHR ROM, 128 KB = 32 banks of 4 KB */
  extern const uint8_t *nes_prg_lo;       /* the 16 KB bank mapped at $8000 */
  extern const uint8_t *nes_prg_hi;       /* the fixed last bank at $C000 */
@@ -783,19 +844,26 @@ index 06885ca..b6b481d 100644
  #define WAIT_VBL 1
  
 diff --git a/src/nes68k.s b/src/nes68k.s
-index 753d82f..f9f3435 100644
+index 753d82f..4318d34 100644
 --- a/src/nes68k.s
 +++ b/src/nes68k.s
-@@ -11,6 +11,8 @@
+@@ -6,11 +6,15 @@
+ ; This file is included by src/gen68k.s, in its code section, so that the many bsr to these helpers stay
+ ; inside one section. It is not assembled on its own.
+         xdef    _asm_run,_asm_dispatch
++        xdef    _w2000,_w2001,_w2003,_w2004,_w2005,_w2006,_w2007,_w8000,_r4016,_r2007
+         xdef    _dispatch,_unwind,_io_rd,_io_wr,_rd_ea,_wr_ea_d0,_php,_plp,_set_prg,_wait   ; for the profiler only
+         xref    _cpu_a,_cpu_s,_cpu_x,_cpu_y,_cpu_c,_cpu_z,_cpu_n,_cpu_v,_cpu_i,_cpu_d
  ;       _cpu_x,_cpu_y,_cpu_s,_cpu_c,_cpu_z,_cpu_n,_cpu_v,_cpu_i,_cpu_d
          xref    _nes_ram,_nes_prg_lo,_nes_prg_hi,_nes_prg_data,_ppu_v,_ppu_ctrl,_nes_vram,_nes_dirty,_nes_dirty_flag,_nes_ndirty,_nes_redraw_all,_nes_bank,_mmc_shift,_mmc_chr0,_mmc_chr1,_mmc_ctrl,_mmc_prg,_pad_shift,_pad_strobe,_nes_pad
          xref    _nes_io_read,_nes_read_s0,_nes_write_slow,_nes_wait,_nes_fatal,_nes_mmc_prg,_nes_mmc_ctrl
++        xref    _apu_reg,_apu_trig
 +        xref    _ppu_w,_ppu_oamaddr,_ppu_rdbuf,_ppu_t,_ppu_fx,_ppu_mask,_nes_oam
 +        xref    _nes_idle,_nes_mapper,_ax_reg,_nt_map,_nes_chr_ram,_chr_dirty_flag,_chr_dirty,_chr_ndirty,_nes_prg_hi
  
  ; ---- moving the 6502 state between the globals and the registers
  _load_state:
-@@ -25,7 +27,7 @@ _load_state:
+@@ -25,7 +29,7 @@ _load_state:
          move.b  _cpu_s,d4
          lea     ($81,a5,d4.w),a2
          move.l  _nes_prg_lo,a3
@@ -804,7 +872,31 @@ index 753d82f..f9f3435 100644
          move.b  _cpu_v,d5
          moveq   #0,d4
          tst.b   _cpu_c
-@@ -120,8 +122,10 @@ _dispatch:
+@@ -114,14 +118,34 @@ _rti:
+         movea.l (sp)+,a0
+         jmp     2(a0)
+ 
++; ---- as _dispatch, and remember the result in the jump site's cache at a0: address.w, bank.b, function.l
++_dispatch_ic:
++        move.l  a0,-(sp)
++        move.w  d7,(a0)
++        move.b  _nes_bank,2(a0)
++        pea     .fill(pc)
++        bra.s   _dispatch_find
++.fill   movea.l (sp)+,a0                ; a1 = the function: keep it
++        move.l  a1,4(a0)
++        move.w  d6,ccr
++        jmp     (a1)
++
+ ; ---- jump to the translated function for d7.w in the mapped bank; d6 = the flags to restore
+ _dispatch:
++        pea     .go(pc)
++        bra.s   _dispatch_find
++.go     move.w  d6,ccr
++        jmp     (a1)
++_dispatch_find:                         ; -> a1 = the function (returns), or _fatal
++
+         movem.l d0-d2,-(sp)
          moveq   #0,d0
          move.w  d7,d0                   ; address
          moveq   #7,d1                   ; bank: 7 = the fixed one
@@ -815,7 +907,19 @@ index 753d82f..f9f3435 100644
          cmp.l   #$8000,d0
          bcs.s   .nf
          move.b  _nes_bank,d1
-@@ -163,6 +167,13 @@ _fatal:                                 ; d7.w = address, d4 = reason: tell C, t
+@@ -143,9 +167,9 @@ _dispatch:
+         bra.s   .probe
+ .found  movea.l 4(a0,d3.w),a1
+         movem.l (sp)+,d0-d2
+-        move.w  d6,ccr
+-        jmp     (a1)
++        rts
+ .nf     movem.l (sp)+,d0-d2
++        addq.l  #4,sp                   ; the caller's continuation
+         moveq   #3,d4
+         bra.s   _fatal
+ _fatal_op:
+@@ -163,6 +187,13 @@ _fatal:                                 ; d7.w = address, d4 = reason: tell C, t
          moveq   #0,d7
          jmp     2(a0)
  
@@ -829,7 +933,7 @@ index 753d82f..f9f3435 100644
  ; ---- frame boundary: a1 = address of the wait loop (an address register: loading it leaves the flags)
  _wait_ram:
          pea     0.w
-@@ -183,6 +194,47 @@ _wait:  bsr     _store_state
+@@ -183,6 +214,47 @@ _wait:  bsr     _store_state
  ; ---- memory that is not plain RAM or ROM. All keep d0-d3, d5-d7, a0-a6 and the flags.
  _io_rd:                                 ; a0 = address -> d4
          move.w  ccr,-(sp)
@@ -877,7 +981,7 @@ index 753d82f..f9f3435 100644
          cmpa.w  #$4016,a0               ; the controller: done here, as nes_io_read() does it
          bne.s   .slow
          move.b  _pad_shift,d4
-@@ -229,6 +281,7 @@ _io_wr_d2:
+@@ -229,6 +301,7 @@ _io_wr_d2:
          movem.l d0-d1/a0-a1,-(sp)
          moveq   #0,d4
          move.b  d2,d4
@@ -885,7 +989,7 @@ index 753d82f..f9f3435 100644
  _set_prg:                               ; d4 = new MMC1 PRG register: as five serial writes would leave it
          move.w  ccr,-(sp)
          move.b  _mmc_ctrl,d3
-@@ -271,19 +324,21 @@ _io_wr_d4:
+@@ -271,19 +344,21 @@ _io_wr_d4:
          move.w  ccr,-(sp)
          movem.l d0-d1/a0-a1,-(sp)
          and.l   #$ff,d4
@@ -915,7 +1019,7 @@ index 753d82f..f9f3435 100644
          lea     _nes_vram,a0
          cmp.b   (a0,d3.w),d4
          beq.s   .inc
-@@ -307,8 +362,93 @@ _io_wr: cmpa.w  #$2007,a0               ; PPU data port: nametable writes done h
+@@ -307,8 +382,93 @@ _io_wr: cmpa.w  #$2007,a0               ; PPU data port: nametable writes done h
          moveq   #32,d3
  .i1     add.w   d3,_ppu_v
          bra     .done
@@ -1010,7 +1114,39 @@ index 753d82f..f9f3435 100644
          btst    #7,d4
          bne     .call
          move.b  _mmc_shift,d3
-@@ -328,11 +468,36 @@ _io_wr: cmpa.w  #$2007,a0               ; PPU data port: nametable writes done h
+@@ -321,18 +481,67 @@ _io_wr: cmpa.w  #$2007,a0               ; PPU data port: nametable writes done h
+ .m1     move.b  d3,_mmc_shift
+         bra     .done
+ .pad    cmpa.w  #$4016,a0               ; controller strobe
+-        bne     .call
++        beq.s   .pad1
++        cmpa.w  #$4018,a0               ; APU registers (not the OAM DMA): as nes_write_slow() does them
++        bcc     .call
++        cmpa.w  #$4000,a0
++        bcs     .call
++        cmpa.w  #$4014,a0
++        beq     .call
++        move.w  a0,d3
++        sub.w   #$4000,d3
++        lea     _apu_reg,a1
++        move.b  d4,(a1,d3.w)
++        cmp.w   #$15,d3
++        bne.s   .apu1
++        or.b    #$10,_apu_trig
++        bra     .done
++.apu1   cmp.w   #$10,d3
++        bcc     .done
++        move.w  d3,d0
++        and.w   #3,d0
++        cmp.w   #3,d0
++        bne     .done
++        lsr.w   #2,d3
++        bset    d3,_apu_trig
++        bra     .done
++.pad1
+         move.b  d4,d3
+         and.b   #1,d3
+         move.b  d3,_pad_strobe
          beq     .done
          move.b  _nes_pad,_pad_shift
          bra     .done
@@ -1047,6 +1183,317 @@ index 753d82f..f9f3435 100644
  .done   movem.l (sp)+,d0-d1/a0-a1
          move.w  (sp)+,ccr
          rts
+@@ -450,3 +659,310 @@ N       set     0
+         dc.b    (N-1)&255
+ N       set     N+1
+         endr
++
++        section gencode,code
++; ---- lean store helpers for single registers (tools/back68k.py calls _wXXXX_dN, which puts the value in d4,
++; zero-extended, and the flags on the stack). They may change d3, d4, a0 and a1 only, and end with the flags.
++_w2000: move.b  d4,_ppu_ctrl
++        move.w  _ppu_t,d3
++        and.w   #$f3ff,d3
++        and.w   #3,d4
++        lsl.w   #8,d4
++        lsl.w   #2,d4
++        or.w    d4,d3
++        move.w  d3,_ppu_t
++        move.w  (sp)+,ccr
++        rts
++_w2001: move.b  d4,_ppu_mask
++        move.w  (sp)+,ccr
++        rts
++_w2003: move.b  d4,_ppu_oamaddr
++        move.w  (sp)+,ccr
++        rts
++_w2004: moveq   #0,d3
++        move.b  _ppu_oamaddr,d3
++        lea     _nes_oam,a0
++        move.b  d4,(a0,d3.w)
++        addq.b  #1,_ppu_oamaddr
++        move.w  (sp)+,ccr
++        rts
++_w2005: tst.b   _ppu_w
++        bne.s   .b
++        move.b  d4,d3
++        and.b   #7,d3
++        move.b  d3,_ppu_fx
++        lsr.b   #3,d4
++        move.w  _ppu_t,d3
++        and.w   #$ffe0,d3
++        or.w    d4,d3
++        move.w  d3,_ppu_t
++        move.b  #1,_ppu_w
++        move.w  (sp)+,ccr
++        rts
++.b      move.w  d4,d3
++        and.w   #7,d3
++        ror.w   #4,d3                   ; << 12
++        and.w   #$f8,d4
++        lsl.w   #2,d4
++        or.w    d3,d4
++        move.w  _ppu_t,d3
++        and.w   #$8c1f,d3
++        or.w    d4,d3
++        move.w  d3,_ppu_t
++        clr.b   _ppu_w
++        move.w  (sp)+,ccr
++        rts
++_w2006: move.w  _ppu_t,d3
++        tst.b   _ppu_w
++        bne.s   .b
++        and.w   #$00ff,d3
++        and.w   #$3f,d4
++        lsl.w   #8,d4
++        or.w    d4,d3
++        move.w  d3,_ppu_t
++        move.b  #1,_ppu_w
++        move.w  (sp)+,ccr
++        rts
++.b      and.w   #$ff00,d3
++        or.w    d4,d3
++        move.w  d3,_ppu_t
++        move.w  d3,_ppu_v
++        clr.b   _ppu_w
++        move.w  (sp)+,ccr
++        rts
++_w2007: move.w  _ppu_v,d3
++        and.w   #$3fff,d3
++        cmp.w   #$2000,d3
++        bcs     .chr
++        cmp.w   #$3f00,d3
++        bcc     .slow
++        move.l  d0,-(sp)                ; nametable cell: nt_map[(v >> 10) & 3] | (v & $3ff)
++        move.w  d3,d0
++        lsr.w   #8,d0
++        lsr.w   #1,d0
++        and.w   #6,d0
++        lea     _nt_map,a1
++        and.w   #$3ff,d3
++        or.w    (a1,d0.w),d3
++        move.l  (sp)+,d0
++        lea     _nes_vram,a0
++        cmp.b   (a0,d3.w),d4
++        beq.s   .inc
++        move.b  d4,(a0,d3.w)
++        lea     _nes_dirty_flag,a0
++        tst.b   (a0,d3.w)
++        bne.s   .inc
++        cmp.w   #1024,_nes_ndirty       ; NES_DIRTY_MAX
++        bcs.s   .mk
++        move.b  #1,_nes_redraw_all
++        bra.s   .inc
++.mk     move.b  #1,(a0,d3.w)
++        lea     _nes_dirty,a1
++        adda.w  _nes_ndirty,a1
++        adda.w  _nes_ndirty,a1
++        move.w  d3,(a1)
++        addq.w  #1,_nes_ndirty
++.inc    btst    #2,_ppu_ctrl
++        bne.s   .i32
++        addq.w  #1,_ppu_v
++        move.w  (sp)+,ccr
++        rts
++.i32    add.w   #32,_ppu_v
++        move.w  (sp)+,ccr
++        rts
++.chr    cmp.b   #7,_nes_mapper          ; CHR RAM: store and mark the tile; CHR ROM: nothing
++        bne.s   .inc
++        lea     _nes_chr_ram,a0
++        cmp.b   (a0,d3.w),d4
++        beq.s   .inc
++        move.b  d4,(a0,d3.w)
++        lsr.w   #4,d3
++        lea     _chr_dirty_flag,a0
++        tst.b   (a0,d3.w)
++        bne.s   .inc
++        move.b  #1,(a0,d3.w)
++        lea     _chr_dirty,a1
++        adda.w  _chr_ndirty,a1
++        adda.w  _chr_ndirty,a1
++        move.w  d3,(a1)
++        addq.w  #1,_chr_ndirty
++        bra.s   .inc
++.slow   move.w  (sp)+,ccr               ; palette: the general path
++        lea     $2007.w,a0
++        bra     _io_wr_d4
++_w8000: move.b  _ax_reg,d3              ; AxROM bank register: 32 KB bank, one-screen page in bit 4
++        move.b  d4,_ax_reg
++        eor.b   d4,d3
++        and.l   #3,d4
++        move.b  d4,_nes_bank
++        lsl.l   #8,d4
++        lsl.l   #7,d4                   ; bank * $8000
++        lea     _nes_prg_data,a3
++        adda.l  d4,a3
++        move.l  a3,_nes_prg_lo
++        lea     $4000(a3),a4
++        move.l  a4,_nes_prg_hi
++        btst    #4,d3
++        beq.s   .d
++        moveq   #0,d3
++        btst    #4,_ax_reg
++        beq.s   .p
++        move.w  #$400,d3
++.p      lea     _nt_map,a0
++        move.w  d3,(a0)+
++        move.w  d3,(a0)+
++        move.w  d3,(a0)+
++        move.w  d3,(a0)+
++.d      move.w  (sp)+,ccr
++        rts
++
++; ---- lean read helpers: -> d4; may change d3, a0, a1; keep the flags
++_r4016: move.w  ccr,-(sp)
++        move.b  _pad_shift,d4
++        tst.b   _pad_strobe
++        bne.s   .1
++        move.b  d4,d3
++        lsr.b   #1,d3
++        or.b    #$80,d3
++        move.b  d3,_pad_shift
++.1      and.b   #1,d4
++        or.b    #$40,d4
++        move.w  (sp)+,ccr
++        rts
++_r2007: move.w  ccr,-(sp)
++        move.w  _ppu_v,d3
++        and.w   #$3fff,d3
++        cmp.w   #$3f00,d3
++        bcc.s   .slow
++        cmp.w   #$2000,d3
++        bcc.s   .nt
++        cmp.b   #7,_nes_mapper
++        bne.s   .slow
++        lea     _nes_chr_ram,a0
++        bra.s   .got
++.nt     move.l  d0,-(sp)
++        move.w  d3,d0
++        lsr.w   #8,d0
++        lsr.w   #1,d0
++        and.w   #6,d0
++        lea     _nt_map,a1
++        and.w   #$3ff,d3
++        or.w    (a1,d0.w),d3
++        move.l  (sp)+,d0
++        lea     _nes_vram,a0
++.got    move.b  _ppu_rdbuf,d4
++        move.b  (a0,d3.w),_ppu_rdbuf
++        btst    #2,_ppu_ctrl
++        bne.s   .i32
++        addq.w  #1,_ppu_v
++        move.w  (sp)+,ccr
++        rts
++.i32    add.w   #32,_ppu_v
++        move.w  (sp)+,ccr
++        rts
++.slow   move.w  (sp)+,ccr
++        lea     $2007.w,a0
++        bra     _io_rd
++
++; ---- _ntcopy: d7.w = count - 1, a1 = source bytes: as many writes to $2007 (hand-written routines).
++; Changes d0, d3, d4, d6, d7, a0, a1 and the flags.
++        xdef    _ntcopy
++_ntcopy:
++        move.l  a2,-(sp)
++        moveq   #1,d6
++        btst    #2,_ppu_ctrl
++        beq     .l
++        moveq   #32,d6
++        ; fast path: +32 a write, all of it inside one nametable's tile area: the cell address once
++        move.w  _ppu_v,d3
++        and.w   #$3fff,d3
++        cmp.w   #$2000,d3
++        bcs     .l
++        cmp.w   #$3000,d3
++        bcc     .l
++        move.w  d3,d0
++        and.w   #$3ff,d0
++        move.w  d7,d4
++        lsl.w   #5,d4
++        add.w   d0,d4                   ; offset of the last write in its nametable
++        cmp.w   #$3c0,d4
++        bcc     .l                      ; reaches the attributes or the next table: the general loop
++        move.w  d3,d4
++        lsr.w   #8,d4
++        lsr.w   #1,d4
++        and.w   #6,d4
++        lea     _nt_map,a0
++        or.w    (a0,d4.w),d0            ; d0 = nes_vram index of the first cell
++        move.w  d7,d4
++        addq.w  #1,d4
++        lsl.w   #5,d4
++        add.w   d4,_ppu_v               ; v after all of them
++        lea     _nes_vram,a0
++        adda.w  d0,a0
++.f      move.b  (a1)+,d4
++        cmp.b   (a0),d4
++        bne.s   .fw
++.fn     lea     32(a0),a0
++        add.w   #32,d0
++        dbf     d7,.f
++        move.l  (sp)+,a2
++        rts
++.fw     move.b  d4,(a0)                 ; changed: store and mark the cell
++        lea     _nes_dirty_flag,a2
++        tst.b   (a2,d0.w)
++        bne.s   .fn
++        cmp.w   #1024,_nes_ndirty
++        bcs.s   .fm
++        move.b  #1,_nes_redraw_all
++        bra.s   .fn
++.fm     move.b  #1,(a2,d0.w)
++        lea     _nes_dirty,a2
++        adda.w  _nes_ndirty,a2
++        adda.w  _nes_ndirty,a2
++        move.w  d0,(a2)
++        addq.w  #1,_nes_ndirty
++        bra.s   .fn
++.l      move.b  (a1)+,d4
++        move.w  _ppu_v,d3
++        and.w   #$3fff,d3
++        cmp.w   #$2000,d3
++        bcs.s   .gen
++        cmp.w   #$3f00,d3
++        bcc.s   .gen
++        move.w  d3,d0
++        lsr.w   #8,d0
++        lsr.w   #1,d0
++        and.w   #6,d0
++        lea     _nt_map,a0
++        and.w   #$3ff,d3
++        or.w    (a0,d0.w),d3
++        lea     _nes_vram,a0
++        cmp.b   (a0,d3.w),d4
++        beq.s   .inc
++        move.b  d4,(a0,d3.w)
++        lea     _nes_dirty_flag,a0
++        tst.b   (a0,d3.w)
++        bne.s   .inc
++        cmp.w   #1024,_nes_ndirty
++        bcs.s   .mk
++        move.b  #1,_nes_redraw_all
++        bra.s   .inc
++.mk     move.b  #1,(a0,d3.w)
++        lea     _nes_dirty,a2
++        adda.w  _nes_ndirty,a2
++        adda.w  _nes_ndirty,a2
++        move.w  d3,(a2)
++        addq.w  #1,_nes_ndirty
++.inc    add.w   d6,_ppu_v
++        dbf     d7,.l
++        move.l  (sp)+,a2
++        rts
++.gen    move.w  ccr,-(sp)               ; not the nametable: the general helper (it pops the flags)
++        movem.l d6-d7/a1,-(sp)
++        move.w  12(sp),-(sp)
++        bsr     _w2007
++        movem.l (sp)+,d6-d7/a1
++        addq.l  #2,sp
++        dbf     d7,.l
++        move.l  (sp)+,a2
++        rts
 diff --git a/src/run68k.c b/src/run68k.c
 index cad9ffc..f9cab2e 100644
 --- a/src/run68k.c
@@ -1114,10 +1561,15 @@ index 4ace87b..80fea19 100644
  
  ; void spr_put(UBYTE *e __asm("a0"), UBYTE *o __asm("a1"), const UBYTE *chr __asm("a2"), ULONG ctl __asm("d0"))
 diff --git a/tools/back68k.py b/tools/back68k.py
-index f840948..40afce1 100644
+index f840948..5effdec 100644
 --- a/tools/back68k.py
 +++ b/tools/back68k.py
-@@ -39,6 +39,7 @@ def generate(g):
+@@ -35,10 +35,12 @@ INV = {'bcc': 'bcs', 'bcs': 'bcc', 'beq': 'bne', 'bne': 'beq', 'bpl': 'bmi', 'bm
+ 
+ def generate(g):
+     HLE, HLE_FALLBACK = g['game'].HLE, g['game'].HLE_FALLBACK      # hand-written routines: per game (tools/games/)
++    HLE_PREFIX = getattr(g['game'], 'HLE_PREFIX', {})   # (bank, entry): (text, address the translation resumes at)
+     entries, body, insn, ctx_of = g['entries'], g['body'], g['insn'], g['ctx_of']
      FIXED, NORETURN, static_branch, successors = g['FIXED'], g['NORETURN'], g['static_branch'], g['successors']
      wait_kind, rd, outdir = g['wait_kind'], g['rd'], g['outdir']
      reset, nmi, irq, dynamic = g['reset'], g['nmi'], g['irq'], g['dynamic_entries']
@@ -1125,7 +1577,7 @@ index f840948..40afce1 100644
  
      def fname(ctx, a): return 'F%d_%04x' % (ctx_of(ctx, a), a)
      banks_for = collections.defaultdict(list)
-@@ -47,6 +48,7 @@ def generate(g):
+@@ -47,6 +49,7 @@ def generate(g):
  
      def callees(ctx, at, t):
          """the functions a JSR at 'at' to t can reach"""
@@ -1133,7 +1585,7 @@ index f840948..40afce1 100644
          if t >= 0xc000: return [(FIXED, t)]
          if t < 0x8000: return []
          if ctx != FIXED and at < 0xc000: return [(ctx, t)] if (ctx, t) in entries else []
-@@ -75,6 +77,7 @@ def generate(g):
+@@ -75,6 +78,7 @@ def generate(g):
          funcs[(ctx, e)] = dict(ctx=ctx, entry=e, addrs=addrs, aset=aset, info=info)
  
      def tail_fns(ctx, at, t):
@@ -1141,7 +1593,7 @@ index f840948..40afce1 100644
          if t >= 0xc000: return [(FIXED, t)]
          if t < 0x8000: return []
          if ctx != FIXED and at < 0xc000: return [(ctx, t)]
-@@ -188,6 +191,7 @@ def generate(g):
+@@ -188,6 +192,7 @@ def generate(g):
  
      def call_target(ctx, at, t):
          """label for bsr/jmp to the code at t"""
@@ -1149,7 +1601,70 @@ index f840948..40afce1 100644
          if t >= 0xc000: return fname(FIXED, t)
          if t < 0x8000: return dynstub(t)
          if ctx != FIXED and at < 0xc000 and (ctx, t) in entries: return fname(ctx, t)
-@@ -273,7 +277,8 @@ def generate(g):
+@@ -208,6 +213,8 @@ def generate(g):
+             if arg < 0x2000: return [], '%d(a5)' % ((arg & 0x7ff) - 0x80), False
+             if arg >= 0xc000: return [], '%d(a4)' % (arg - 0xc000), False
+             if arg >= 0x8000: return [], '%d(a3)' % (arg - 0x8000), False
++            if arg == 0x4017: return ['moveq #$40,d4'], 'd4', True          # second pad: nothing there
++            if arg in (0x2007, 0x4016): return ['bsr _r%04x' % arg], 'd4', False   # lean helpers (src/nes68k.s)
+             return ['lea $%04x.w,a0' % arg, 'bsr _io_rd'], 'd4', False
+         if mode in ('abx', 'aby'):
+             r = 'd1' if mode == 'abx' else 'd2'
+@@ -217,6 +224,15 @@ def generate(g):
+             if arg >= 0x8000 and arg + 255 < 0xc000: return [], '(%d,a3,%s.w)' % (arg - 0x8000, r), False
+             return ['movea.l #$%04x,a0' % arg, 'adda.l %s,a0' % r, 'bsr _rd_ea'], 'd4', True
+         if mode == 'izy':
++            if AX:                              # the pointer is nearly always into ROM: read it here (a3 = $8000)
++                st = newstub()
++                slow = ['moveq #0,d7', 'move.w %d(a5),d7' % (arg - 0x80), 'rol.w #8,d7', 'movea.l d7,a0', 'adda.l d2,a0', 'bsr _rd_ea']
++                if ptrc['zp'] == arg:           # a6 = where ($zp) points in the mapped ROM, or 0 (not ROM)
++                    return ['move.l a6,d7', 'beq.s %sa' % st, 'move.b (a6,d2.w),d4', 'bra.s %sb' % st, '%sa:' % st] + slow + ['%sb:' % st], 'd4', True
++                ptrc['zp'] = arg
++                return ['moveq #0,d7', 'move.w %d(a5),d7' % (arg - 0x80), 'rol.w #8,d7', 'movea.l d7,a0',
++                        'cmpa.l #$8000,a0', 'bcs.s %sa' % st, 'lea (-$8000,a3,a0.l),a6', 'move.b (a6,d2.w),d4', 'bra.s %sb' % st,
++                        '%sa:' % st, 'suba.l a6,a6', 'adda.l d2,a0', 'bsr _rd_ea', '%sb:' % st], 'd4', True
+             return ['moveq #0,d7', 'move.w %d(a5),d7' % (arg - 0x80), 'rol.w #8,d7', 'movea.l d7,a0', 'adda.l d2,a0', 'bsr _rd_ea'], 'd4', True
+         if mode == 'izx':
+             return ['lea %d(a5,d1.w),a0' % (arg - 0x80), 'moveq #0,d7', 'move.w (a0),d7', 'rol.w #8,d7', 'movea.l d7,a0', 'bsr _rd_ea'], 'd4', True
+@@ -227,6 +243,10 @@ def generate(g):
+         if mode in ('zp', 'zpx', 'zpy') or (mode == 'abs' and arg < 0x2000) or (mode in ('abx', 'aby') and arg < 0x2000 and (arg & 0x7ff) + 255 < 0x900):
+             pre, op, _ = operand(mode, arg)
+             return pre + ['move.b %s,%s' % (reg, op)], False
++        if mode == 'abs' and (arg in LEAN or (AX and arg >= 0x8000)):  # a helper for this register alone
++            key = 0x8000 if arg >= 0x8000 else arg
++            lean_used.add((key, reg))
++            return ['bsr _w%04x_%s' % (key, reg)], None
+         if mode == 'abs':
+             return ['lea $%04x.w,a0' % arg if arg < 0x8000 else 'movea.l #$%04x,a0' % arg, 'bsr _io_wr_%s' % reg], None
+         if mode in ('abx', 'aby'):
+@@ -238,6 +258,10 @@ def generate(g):
+             return ['lea %d(a5,d1.w),a0' % (arg - 0x80), 'moveq #0,d7', 'move.w (a0),d7', 'rol.w #8,d7', 'movea.l d7,a0', 'bsr _wr_ea_%s' % reg], True
+         raise ValueError(mode)
+ 
++    LEAN = {0x2000, 0x2001, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007}
++    lean_used = set()
++    icn = [0]
++    ptrc = {'zp': None}                     # the (zp),Y pointer whose ROM address a6 holds, in this basic block
+     stubcount = [0]
+     def newstub():
+         stubcount[0] += 1
+@@ -265,15 +289,23 @@ def generate(g):
+             for l in ['move.w ccr,d6', 'movea.l (sp)+,a0', 'cmpm.w (a2)+,(a0)+', 'bne _unwind', 'move.w d6,ccr', 'jmp (a0)']: E('    ' + l)
+             if (ctx, e) not in HLE_FALLBACK: continue
+             E('.orig:')
+-        if addrs and addrs[0] != e: E('    bra .L%04x' % e)
++        if (ctx, e) in HLE_PREFIX:              # hand-written first part, then the translation from 'resume' on
++            text, resume = HLE_PREFIX[(ctx, e)]
++            labels.add(resume)
++            E('; hand-written equivalent of the 6502 code up to $%04x' % resume)
++            for l in text.strip('\n').split('\n'): E(l)
++            E('    bra .L%04x' % resume)
++        elif addrs and addrs[0] != e: E('    bra .L%04x' % e)
+         nzsrc = None; c68 = None; known_c = None; fuse = None
++        ptrc['zp'] = None
+         # waits
+         waits = {}
+         for a in addrs:
              d = f['info'][a]['d']
              if d and d[1] == 'rel' and d[2] <= a and d[2] in aset:
                  kd = wait_kind(ctx, d[2], a)
@@ -1159,7 +1674,21 @@ index f840948..40afce1 100644
          s0 = set()
          for a in addrs:
              d = f['info'][a]['d']
-@@ -439,7 +444,8 @@ def generate(g):
+@@ -291,6 +323,13 @@ def generate(g):
+             if a in labels:
+                 E('.L%04x:' % a)
+                 nzsrc = None; c68 = None; known_c = None; fuse = None
++                ptrc['zp'] = None
++            if d and ptrc['zp'] is not None:    # anything that may change the pointer, a3 or a6 ends the cache
++                m0, mode0, arg0, _ = d
++                if m0 in ('JSR', 'RTS', 'RTI', 'BRK', 'JMP') or mapper_write(d): ptrc['zp'] = None
++                elif m0 in ('STA', 'STX', 'STY', 'INC', 'DEC', 'ASL', 'LSR', 'ROL', 'ROR') and mode0 not in ('acc', 'imp'):
++                    if mode0 in ('zpx', 'zpy', 'izx', 'izy') or (mode0 in ('zp', 'abs') and arg0 in (ptrc['zp'], (ptrc['zp'] + 1) & 0xff)) \
++                       or (mode0 in ('abx', 'aby') and arg0 < 0x100): ptrc['zp'] = None
+             if not d:
+                 E('    move.w #$%04x,d7' % a); E('    bra _fatal_op'); continue
+             m, mode, arg, n = d
+@@ -439,7 +478,8 @@ def generate(g):
                  if a in waits:
                      kd, lp = waits[a]
                      st = newstub()
@@ -1169,7 +1698,7 @@ index f840948..40afce1 100644
                      tgt = st
                  if sb is True:
                      L.append('bra %s' % tgt)
-@@ -474,7 +480,8 @@ def generate(g):
+@@ -474,7 +514,8 @@ def generate(g):
                  keep_c = True
                  fuse = None
              elif m == 'JMP':
@@ -1179,7 +1708,21 @@ index f840948..40afce1 100644
                      L.append(('bra %s' if arg in aset else 'jmp %s') % goto(arg, a))
                  else:
                      hi = (arg & 0xff00) | ((arg + 1) & 0xff)
-@@ -494,6 +501,10 @@ def generate(g):
+@@ -483,7 +524,12 @@ def generate(g):
+                         L += ['move.b %d(a5),d7' % ((hi & 0x7ff) - 0x80), 'lsl.w #8,d7', 'move.b %d(a5),d7' % ((arg & 0x7ff) - 0x80)]
+                     else:
+                         L += ['lea $%04x.w,a0' % hi, 'bsr _rd_ea', 'move.b d4,d7', 'lsl.w #8,d7', 'lea $%04x.w,a0' % arg, 'bsr _rd_ea', 'move.b d4,d7']
+-                    L.append('jmp _dispatch')
++                    if AX:                          # a cache per jump site: the last (address, bank) and its function
++                        icn[0] += 1; st = newstub()
++                        L += ['lea _ic%d,a0' % icn[0], 'cmp.w (a0),d7', 'bne.s %sm' % st, 'move.b _nes_bank,d4',
++                              'cmp.b 2(a0),d4', 'bne.s %sm' % st, 'movea.l 4(a0),a1', 'move.w d6,ccr', 'jmp (a1)',
++                              '%sm:' % st, 'jmp _dispatch_ic']
++                    else: L.append('jmp _dispatch')
+             elif m == 'JSR':
+                 ret = (a + 2) & 0xffff
+                 sw = ((ret & 0xff) << 8) | (ret >> 8)
+@@ -494,6 +540,10 @@ def generate(g):
                  push = ['move.w #$%04x,-(a2)' % sw]
                  if el & NZ: push = ['move.w ccr,d6'] + push + ['move.w d6,ccr']
                  L += push + ['bsr %s' % call_target(ctx, a, arg), 'dc.w $%04x' % sw]
@@ -1190,7 +1733,7 @@ index f840948..40afce1 100644
                  nzsrc = None; c68 = None
              elif m == 'RTS':
                  if exit_live[k] & NZ: L += ['move.w ccr,d6', 'movea.l (sp)+,a0', 'cmpm.w (a2)+,(a0)+', 'bne _unwind', 'move.w d6,ccr', 'jmp (a0)']
-@@ -504,9 +515,11 @@ def generate(g):
+@@ -504,9 +554,11 @@ def generate(g):
                  L += ['move.w #$%04x,d7' % a, 'bra _fatal_op']
              else:
                  raise ValueError(m)
@@ -1203,12 +1746,40 @@ index f840948..40afce1 100644
              if ft and m not in ('JMP', 'RTS', 'RTI', 'BRK') and not (m == 'JSR' and arg in NORETURN) and nxt != fall:
                  if mode == 'rel' and static_branch(ctx, a, i['prev']) is True: pass
                  elif fall in aset: L.append('bra .L%04x' % fall)
-@@ -547,11 +560,12 @@ def generate(g):
+@@ -519,6 +571,8 @@ def generate(g):
+             for l in lines: E('    ' + l)
+ 
+     # dynamic call stubs: the bank decides which function a call into $8000-$BFFF reaches
++    E('    xdef _dynstubs')
++    E('_dynstubs:')                         # (a symbol, so that profiler samples here get a name)
+     for t, lab in sorted(dynstubs.items()):
+         E('%s:' % lab)
+         E('    move.w ccr,d6')
+@@ -533,6 +587,15 @@ def generate(g):
+         E('    move.w #$%04x,d7' % t)
+         E('    bra _dispatch')
+ 
++    # lean store helpers: the value into d4 (zero-extended), the flags onto the stack, then the register's code
++    E('    xdef _lean_prologues')
++    E('_lean_prologues:')
++    for key, reg in sorted(lean_used):
++        E('_w%04x_%s:' % (key, reg))
++        E('    move.w ccr,-(sp)')
++        E('    moveq #0,d4')
++        E('    move.b %s,d4' % reg)
++        E('    bra _w%04x' % key)
+     # the run-time helpers, in this same code section
+     E('    include "src/nes68k.s"')
+     # dispatch: an open-addressing hash of (bank, address) -> function. Bank 7 for $C000-$FFFF.
+@@ -547,11 +610,15 @@ def generate(g):
      E('_disp_hash:')
      for sl in slots:
          E('    dc.w 0,0,0,0' if sl is None else '    dc.w $%04x,%d\n    dc.l %s' % (sl[1], sl[0], fname(sl[0], sl[1])))
 -    E('_reset_fn: dc.l %s' % fname(FIXED, reset))
 -    E('_nmi_fn: dc.l %s' % fname(FIXED, nmi))
++    E('    section genbss,bss')
++    for k in range(1, icn[0] + 1): E('_ic%d: ds.l 2' % k)
++    E('    section gendata,data')
 +    E('_reset_fn: dc.l %s' % fname(RESET_BANK, reset))
 +    E('_nmi_fn: dc.l %s' % fname(RESET_BANK, nmi))
  
@@ -1251,12 +1822,38 @@ index 1861568..ffe5470 100755
 +printf '%s_dbg bench %s\n' "$NAME" "$N" > "$OUT/S/startup-sequence"
 +UAE_DONE="$OUT/bench.txt" tools/run_uae.sh "$OUT" ${UAE_SECS:-$(( N / 20 + 90 ))} "$OUT/shot.png" $UAE_OPTS     # e.g. UAE_OPTS=--fast_memory=4096
  cat "$OUT/bench.txt" 2>/dev/null || echo "no bench.txt"
+diff --git a/tools/framestat.py b/tools/framestat.py
+new file mode 100644
+index 0000000..0bda2ae
+--- /dev/null
++++ b/tools/framestat.py
+@@ -0,0 +1,20 @@
++#!/usr/bin/env python3
++"""framestat.py <debug-run dir> [first_tick] - per drawn frame: ticks run, logic per tick, display time
++(tools/debug_run.sh writes frames.bin, framevt.bin, ticktime.bin). The question it answers: does one tick plus
++one picture fit in a frame (71,051 colour clocks)?"""
++import struct, sys, collections
++D = sys.argv[1] + '/'; first = int(sys.argv[2]) if len(sys.argv) > 2 else 1500
++u = lambda f: (lambda b: struct.unpack('>%dI' % (len(b) // 4), b))(open(D + f, 'rb').read())
++fr = u('frames.bin'); pairs = [(fr[i], fr[i + 1]) for i in range(0, len(fr), 2)]
++vt = u('framevt.bin'); tt = u('ticktime.bin')
++rows = []
++for i in range(1, min(len(pairs), len(vt))):
++    t0, t1 = pairs[i - 1][1], pairs[i][1]
++    if t0 < first or t1 <= t0: continue
++    rows.append((t1 - t0, sum(tt[t0:t1]) // (t1 - t0), vt[i]))
++q = lambda xs, p: sorted(xs)[int(len(xs) * p)]
++L = [r[1] for r in rows]; V = [r[2] for r in rows]; S = [r[1] + r[2] for r in rows]
++print('frames', len(rows), 'ticks per frame', sorted(collections.Counter(r[0] for r in rows).items()))
++for name, xs in (('logic/tick', L), ('display', V), ('one tick + display', S)):
++    print('%-18s avg %6d  p10 %6d  p50 %6d  p90 %6d' % (name, sum(xs) // len(xs), q(xs, .1), q(xs, .5), q(xs, .9)))
++print('one tick + display under 71051: %d%% of frames' % (100 * sum(1 for x in S if x < 71051) // len(S)))
 diff --git a/tools/games/cobra.py b/tools/games/cobra.py
 new file mode 100644
-index 0000000..d358e8c
+index 0000000..6b809ff
 --- /dev/null
 +++ b/tools/games/cobra.py
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,100 @@
 +"""cobra.py - what the translator needs to know about Cobra Triangle (Rare 1989, PAL, AxROM) that it cannot find
 +out by itself. Loaded by tools/recomp.py (--game cobra). See tools/games/llb.py for an MMC1 example and
 +PLAYBOOK-NES.md sections 3-5 for how to find each entry.
@@ -1333,6 +1930,30 @@ index 0000000..d358e8c
 +HLE[(2, 0xffa1)] = _upload(0xde00 - 0x8000)
 +HLE[(2, 0xffa9)] = _upload(0xee00 - 0x8000)
 +HLE_FALLBACK |= {(2, 0xffa1), (2, 0xffa9)}
++
++# $D1A6 in bank 0, every play frame: two nametable columns of 30 cells from the buffer at $0130/$014F
++# ($2000 = $14: +32 a write; $2006 = $20, ($0130); 30 x LDA $0131+i / STA $2007; $2006 = $20, ($014F); 30 more),
++# then on at $D327. By hand with _ntcopy; leaves A = ($016D) with its N and Z, X = $20, C and V as they were.
++HLE_PREFIX = {(0, 0xd1a6): ('''
++    move.w ccr,-(sp)
++    move.b #$14,d0
++    bsr _w2000_d0
++    moveq #$20,d1
++    bsr _w2006_d1
++    move.b $0130-$80(a5),d0
++    bsr _w2006_d0
++    lea $0131-$80(a5),a1
++    moveq #29,d7
++    bsr _ntcopy
++    bsr _w2006_d1
++    move.b $014f-$80(a5),d0
++    bsr _w2006_d0
++    lea $0150-$80(a5),a1
++    moveq #29,d7
++    bsr _ntcopy
++    move.w (sp)+,ccr
++    move.b $016d-$80(a5),d0
++''', 0xd327)}
 diff --git a/tools/make_assets.sh b/tools/make_assets.sh
 index 78c9f87..ce67987 100755
 --- a/tools/make_assets.sh
@@ -1607,10 +2228,10 @@ index c3679d1..9e72e8c 100644
      fclose(log);
 diff --git a/tools/prof.py b/tools/prof.py
 new file mode 100644
-index 0000000..ebafcd8
+index 0000000..ec498f7
 --- /dev/null
 +++ b/tools/prof.py
-@@ -0,0 +1,52 @@
+@@ -0,0 +1,63 @@
 +#!/usr/bin/env python3
 +"""prof.py <debug-run dir> [first_tick last_tick] - name the samples of the 1 kHz profiler (src/prof68k.s).
 +
@@ -1623,7 +2244,11 @@ index 0000000..ebafcd8
 +d = sys.argv[1]
 +lo, hi = (int(sys.argv[2]), int(sys.argv[3])) if len(sys.argv) > 3 else (0, 1 << 30)
 +raw = open(os.path.join(d, 'prof.bin'), 'rb').read()
-+base, cbase = struct.unpack('>II', raw[:8]); pcs = struct.unpack('>%dI' % ((len(raw) - 8) // 4), raw[8:])
++if raw[:4] == b'PRO3':                  # reset function, game_tick, tile8 (the display's assembly hunk)
++    base, cbase, vbase = struct.unpack('>III', raw[4:16]); raw = raw[16:]
++else:
++    base, cbase = struct.unpack('>II', raw[:8]); vbase = None; raw = raw[8:]
++pcs = struct.unpack('>%dI' % (len(raw) // 4), raw)
 +exe = glob.glob(os.path.join(d, '*_dbg'))[0]
 +def nm(args):
 +    out = subprocess.run(['docker', 'run', '--rm', '-v', os.getcwd() + ':/work', '-w', '/work', 'amigadev/crosstools:m68k-amigaos',
@@ -1634,13 +2259,17 @@ index 0000000..ebafcd8
 +        if len(p) == 3 and p[1] in 'tT': syms.append((int(p[0], 16), p[2]))
 +    return sorted(syms)
 +gen = nm('vasmm68k_mot -quiet -Fhunk -m68020 -I. -Isrc -o /tmp/g.o src/gen68k.s && m68k-amigaos-nm /tmp/g.o')
-+cs = nm('m68k-amigaos-nm ' + exe)
++gnames = set(n for a, n in gen)
++cs = [(a, n) for a, n in nm('m68k-amigaos-nm ' + exe) if n not in gnames and not n.startswith('F') and not n.startswith('D_')]
 +goff = dict((n, a) for a, n in gen)
 +gbase = base - goff.get('F0_' + '%04x' % 0, goff[min(goff, key=lambda k: goff[k])]) if False else None
 +ref = [n for a, n in gen if n.startswith('F')]
 +# the reset function's runtime address is base; its symbol is the one _reset_fn points at
 +rsym = subprocess.run(['grep', '-m1', '_reset_fn:', 'src/gen68k.s'], capture_output=True, text=True).stdout.split()[-1]
 +gbase = base - goff[rsym]
++vid = nm('vasmm68k_mot -quiet -Fhunk -m68020 -I. -Isrc -o /tmp/v.o src/video68k.s && m68k-amigaos-nm /tmp/v.o') if vbase else []
++voff = dict((n, a) for a, n in vid)
++vaddr = [a + vbase - voff.get('_tile8', 0) for a, n in vid] if vbase else []; vname = [n for a, n in vid]
 +cmap = dict((n, a) for a, n in cs)
 +cb = cbase - cmap.get('_game_tick', 0)
 +gaddr = [a + gbase for a, n in gen]; gname = [n for a, n in gen]
@@ -1659,6 +2288,9 @@ index 0000000..ebafcd8
 +    n += 1
 +    j = bisect.bisect_right(gaddr, pc) - 1
 +    if j >= 0 and pc - gaddr[j] < 0x4000 and gname[j] and pc < gaddr[-1] + 0x2000: cnt['gen ' + gname[j]] += 1; continue
++    if vaddr:
++        j = bisect.bisect_right(vaddr, pc) - 1
++        if j >= 0 and pc - vaddr[j] < 0x1000: cnt['asm ' + vname[j]] += 1; continue
 +    j = bisect.bisect_right(caddr, pc) - 1
 +    cnt['C ' + (cname[j] if j >= 0 else '?')] += 1
 +print('samples', n)
