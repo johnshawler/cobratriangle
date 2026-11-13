@@ -1,7 +1,7 @@
 /* vhost.c - host only: runs the game logic and src/video.c with a fake kit display, and writes what the
  * Amiga would show (playfield + hardware sprites) as PPM pictures. For finding display bugs without the emulator.
  *   cc -Itools/hostinc -Ikit -Isrc tools/vhost.c src/video.c src/logic.c src/nes.c src/run_c.c src/coro_host.c src/gen_*.c
- *   vhost N t1,t2,...   (frames: one display frame per tick, 60 a second)
+ *   vhost N t1,t2,...   (frames: one display frame per tick)
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,24 +41,36 @@ static void shot(const char *name)
         for (p = 0; p < 4; p++) c |= ((disp_front[off + p * disp_plane] >> b) & 1) << p;
         img[y][x] = pal[c];
     }
-    for (n = 0; n < 7; n += 1) {            /* walk each sprite list: segments of (pos, ctl, lines) */
-        UBYTE *d = (UBYTE *)spr[n], *o; int odd = n & 1;
-        if (!d || (n < 6 && odd)) continue;
-        o = (n < 6 && spr[n + 1]) ? (UBYTE *)spr[n + 1] : 0;
+    for (n = 6; n >= 0; n--) {              /* walk each sprite list: segments of (pos, ctl, lines); lower numbers on top */
+        UBYTE *d = (UBYTE *)spr[n];
+        if (!d) continue;
         for (;;) {
+            UWORD pos, ctl; int vs, ve, hs, l; UBYTE *o = 0;
             if (d - (UBYTE *)spr[n] > 4600) { fprintf(stderr, "sprite %d list runs past its block\n", n); break; }
-            UWORD pos = (UWORD)(d[0] << 8 | d[1]), ctl = (UWORD)(d[8] << 8 | d[9]);
-            int vs = pos >> 8, ve = ctl >> 8, hs = ((pos & 0xff) << 1) | (ctl & 1), l;
+            pos = (UWORD)(d[0] << 8 | d[1]); ctl = (UWORD)(d[8] << 8 | d[9]);
+            vs = pos >> 8; ve = ctl >> 8; hs = ((pos & 0xff) << 1) | (ctl & 1);
             if (!pos && !ctl) break;
             vs |= (ctl & 4) << 6; ve |= (ctl & 2) << 7;
             if (ve <= vs) { fprintf(stderr, "sprite %d: bad segment vs %d ve %d\n", n, vs, ve); break; }
+            if ((n & 1) && (ctl & 0x80)) { d += 16 + (ve - vs) * 16; continue; }    /* drawn with its even sprite */
+            if (!(n & 1) && spr[n + 1]) {           /* an attached odd segment at the same place? */
+                UBYTE *q = (UBYTE *)spr[n + 1];
+                for (;;) {
+                    UWORD p2 = (UWORD)(q[0] << 8 | q[1]), c2 = (UWORD)(q[8] << 8 | q[9]); int v2 = p2 >> 8, e2 = c2 >> 8;
+                    if (!p2 && !c2) break;
+                    v2 |= (c2 & 4) << 6; e2 |= (c2 & 2) << 7;
+                    if (e2 <= v2 || q - (UBYTE *)spr[n + 1] > 4600) break;
+                    if (p2 == pos && (c2 & 0x80)) { o = q; break; }
+                    q += 16 + (e2 - v2) * 16;
+                }
+            }
             for (l = 0; l < ve - vs; l++) for (x = 0; x < 64; x++) {
                 UBYTE *line = d + 16 + l * 16, *ol = o ? o + 16 + l * 16 : 0; int bx = x >> 3, bt = 7 - (x & 7), v, X = hs - 0x80 + x, Y = vs - 0x34 + l;
                 v = ((line[bx] >> bt) & 1) | (((line[8 + bx] >> bt) & 1) << 1);
-                if (ol) v |= (((ol[bx] >> bt) & 1) << 2) | (((ol[8 + bx] >> bt) & 1) << 3); else if (v) v |= 12;
+                if (ol) v |= (((ol[bx] >> bt) & 1) << 2) | (((ol[8 + bx] >> bt) & 1) << 3); else if (v) v |= (n >> 1) << 2;
                 if (v && X >= 0 && X < 320 && Y >= 0 && Y < 240) img[Y][X] = pal[16 + v];
             }
-            d += 16 + (ve - vs) * 16; if (o) o += 16 + (ve - vs) * 16;
+            d += 16 + (ve - vs) * 16;
         }
     }
     f = fopen(name, "wb"); fprintf(f, "P6\n320 240\n255\n");
@@ -72,8 +84,8 @@ int main(int argc, char **argv)
 {
     unsigned n = atoi(argv[1]), t; char key[32], list[4096], name[64]; FILE *g;
     snprintf(list, sizeof list, ",%s,", argc > 2 ? argv[2] : "");
-    g = fopen("assets/prg.bin", "rb"); if (!g || fread(nes_prg_data, 1, 0x20000, g) != 0x20000) return 2; fclose(g);
-    g = fopen("assets/chr.bin", "rb"); if (!g || fread(nes_chr_data, 1, 0x20000, g) != 0x20000) return 2; fclose(g);
+    g = fopen("assets/prg.bin", "rb"); if (!g || !fread(nes_prg_data, 1, 0x20000, g)) return 2; fclose(g);
+    g = fopen("assets/chr.bin", "rb"); if (!g) return 2; if (fread(nes_chr_data, 1, 0x20000, g)) {} fclose(g);   /* empty: CHR RAM */
     game_init(); video_load(); disp_open(&video_display); video_start();
     for (t = 0; t < n; t++) {
         game_tick(game_bench_input(t));

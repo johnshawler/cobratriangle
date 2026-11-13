@@ -44,6 +44,7 @@ int main(int argc, char **argv)
     game_init();
     for (t = 0; t < n; t++) {
         game_tick(game_bench_input(t));
+        if (argc > 2 && !strcmp(argv[2], "-c")) printf("%08x\n", (unsigned)game_trace_sum());   /* -c: every tick */
         if (verbose && (t + 1) % 100 == 0) printf("tick %u checksum %08x frames %u\n", t + 1, (unsigned)game_checksum(), (unsigned)logic_frames);
         if (ramlog) fwrite(nes_ram, 1, sizeof nes_ram, ramlog);
         snprintf(key, sizeof key, ",%u,", t + 1);
@@ -51,6 +52,6 @@ int main(int argc, char **argv)
     }
     if (nes_fatal_why) fprintf(stderr, "STOPPED: reason %d at %04x\n", nes_fatal_why, nes_fatal_pc);
     if (ramlog) fclose(ramlog);
-    printf("ticks=%u checksum=%08x\n", n, (unsigned)game_checksum());
+    if (!(argc > 2 && !strcmp(argv[2], "-c"))) printf("ticks=%u checksum=%08x\n", n, (unsigned)game_checksum());
     return 0;
 }

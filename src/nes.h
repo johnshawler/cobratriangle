@@ -70,6 +70,7 @@ extern uint8_t  split_on, split_ctrl, split_chr0, split_chr1, split_fx, split_li
 extern uint16_t split_t;
 extern uint8_t  split_seen;                     /* a split happened in the NMI that just ran */
 extern uint8_t  split_ax;                       /* AxROM: the bank register (one-screen page in bit 4) above the split */
+extern uint8_t  split_mask, split_pal0;         /* PPUMASK and the backdrop colour above the split */
 
 /* APU: the register file, and which channels were (re)started this frame. The Amiga side plays it. */
 extern uint8_t apu_reg[0x18];

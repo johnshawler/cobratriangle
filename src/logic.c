@@ -120,7 +120,7 @@ void game_tick(unsigned short in)
 #ifdef LOGIC_NOSUM                              /* profiling builds: no checksum work in the ticks */
     if (logic_ntrace < LOGIC_TRACE) logic_trace[logic_ntrace++] = 0;
 #else
-    if (logic_ntrace < LOGIC_TRACE) logic_trace[logic_ntrace++] = game_checksum();
+    if (logic_ntrace < LOGIC_TRACE) logic_trace[logic_ntrace++] = game_trace_sum();
 #endif
 #ifdef LOGIC_DUMP
     if (logic_ntrace == LOGIC_DUMP) { int i; for (i = 0; i < 0x800; i++) logic_dump[i] = nes_ram[i];
@@ -154,6 +154,24 @@ static uint32_t fnv(uint32_t h, const uint8_t *p, unsigned n)
 {
     while (n--) { h ^= *p++; h *= 16777619u; }
     return h;
+}
+
+/* A cheaper checksum of the same state, for the per-tick traces of debug builds (tools/cmp_trace.py). */
+static uint32_t rsum(uint32_t h, const uint8_t *p, unsigned n)
+{
+    for (; n >= 2; n -= 2, p += 2) h = ((h << 3) | (h >> 29)) + (uint32_t)(p[0] << 8 | p[1]);
+    return h;
+}
+uint32_t game_trace_sum(void)
+{
+    uint8_t r[8];
+    uint32_t h = rsum(1, nes_ram, sizeof nes_ram);
+    h = rsum(h, nes_vram, sizeof nes_vram);
+    h = rsum(h, nes_pal, sizeof nes_pal);
+    h = rsum(h, nes_oam, sizeof nes_oam);
+    if (nes_chr == nes_chr_ram) h = rsum(h, nes_chr_ram, sizeof nes_chr_ram);
+    r[0] = cpu_a; r[1] = cpu_x; r[2] = cpu_y; r[3] = cpu_s; r[4] = nes_bank; r[5] = ppu_ctrl; r[6] = ppu_mask; r[7] = (uint8_t)nes_fatal_why;
+    return rsum(h, r, 8);
 }
 
 uint32_t game_checksum(void)

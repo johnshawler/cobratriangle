@@ -11,6 +11,7 @@
 ;       _cpu_x,_cpu_y,_cpu_s,_cpu_c,_cpu_z,_cpu_n,_cpu_v,_cpu_i,_cpu_d
         xref    _nes_ram,_nes_prg_lo,_nes_prg_hi,_nes_prg_data,_ppu_v,_ppu_ctrl,_nes_vram,_nes_dirty,_nes_dirty_flag,_nes_ndirty,_nes_redraw_all,_nes_bank,_mmc_shift,_mmc_chr0,_mmc_chr1,_mmc_ctrl,_mmc_prg,_pad_shift,_pad_strobe,_nes_pad
         xref    _nes_io_read,_nes_read_s0,_nes_write_slow,_nes_wait,_nes_fatal,_nes_mmc_prg,_nes_mmc_ctrl
+        xref    _nes_idle,_nes_mapper,_ax_reg,_nt_map,_nes_chr_ram,_chr_dirty_flag,_chr_dirty,_chr_ndirty,_nes_prg_hi
 
 ; ---- moving the 6502 state between the globals and the registers
 _load_state:
@@ -25,7 +26,7 @@ _load_state:
         move.b  _cpu_s,d4
         lea     ($81,a5,d4.w),a2
         move.l  _nes_prg_lo,a3
-        lea     _nes_prg_data+$1c000,a4
+        move.l  _nes_prg_hi,a4
         move.b  _cpu_v,d5
         moveq   #0,d4
         tst.b   _cpu_c
@@ -120,8 +121,10 @@ _dispatch:
         moveq   #0,d0
         move.w  d7,d0                   ; address
         moveq   #7,d1                   ; bank: 7 = the fixed one
+        ifeq    AXROM
         cmp.l   #$c000,d0
         bcc.s   .h
+        endc
         cmp.l   #$8000,d0
         bcs.s   .nf
         move.b  _nes_bank,d1
@@ -162,6 +165,13 @@ _fatal:                                 ; d7.w = address, d4 = reason: tell C, t
         bne.s   .f1
         moveq   #0,d7
         jmp     2(a0)
+
+; ---- a loop that jumps to itself (a1): the frame ends, nes_idle() never returns (it drops the C stack)
+_idle:  bsr     _store_state
+        move.l  a1,d4
+        and.l   #$ffff,d4
+        move.l  d4,-(sp)
+        jsr     _nes_idle
 
 ; ---- frame boundary: a1 = address of the wait loop (an address register: loading it leaves the flags)
 _wait_ram:
@@ -271,19 +281,21 @@ _io_wr_d4:
         move.w  ccr,-(sp)
         movem.l d0-d1/a0-a1,-(sp)
         and.l   #$ff,d4
-_io_wr: cmpa.w  #$2007,a0               ; PPU data port: nametable writes done here, as vram_write() in nes.c
+_io_wr: cmpa.w  #$2007,a0               ; PPU data port: nametable and CHR RAM writes done here, as vram_write() in nes.c
         bne     .nt9
-        move.b  _mmc_ctrl,d3
-        and.b   #3,d3
-        cmp.b   #2,d3                   ; vertical mirroring only (the game's)
-        bne     .call
         move.w  _ppu_v,d3
         and.w   #$3fff,d3
-        cmp.w   #$2000,d3
-        bcs     .call
         cmp.w   #$3f00,d3
         bcc     .call
-        and.w   #$7ff,d3                ; nametable cell
+        cmp.w   #$2000,d3
+        bcs     .chr
+        move.w  d3,d0                   ; nametable cell: nt_map[(v >> 10) & 3] | (v & $3ff)
+        rol.w   #6,d0
+        and.w   #3,d0
+        add.w   d0,d0
+        lea     _nt_map,a0
+        and.w   #$3ff,d3
+        or.w    (a0,d0.w),d3
         lea     _nes_vram,a0
         cmp.b   (a0,d3.w),d4
         beq.s   .inc
@@ -307,8 +319,27 @@ _io_wr: cmpa.w  #$2007,a0               ; PPU data port: nametable writes done h
         moveq   #32,d3
 .i1     add.w   d3,_ppu_v
         bra     .done
+.chr    cmp.b   #7,_nes_mapper          ; CHR RAM (AxROM): store, and remember the 16-byte tile for the display
+        bne.s   .inc                    ; CHR ROM: the write does nothing
+        lea     _nes_chr_ram,a0
+        cmp.b   (a0,d3.w),d4
+        beq.s   .inc
+        move.b  d4,(a0,d3.w)
+        lsr.w   #4,d3
+        lea     _chr_dirty_flag,a0
+        tst.b   (a0,d3.w)
+        bne.s   .inc
+        move.b  #1,(a0,d3.w)
+        move.w  _chr_ndirty,d0
+        add.w   d0,d0
+        lea     _chr_dirty,a0
+        move.w  d3,(a0,d0.w)
+        addq.w  #1,_chr_ndirty
+        bra.s   .inc
 .nt9    cmpa.l  #$8000,a0               ; MMC1: four of the five serial writes only shift
         bcs     .pad
+        cmp.b   #7,_nes_mapper
+        beq     .ax
         btst    #7,d4
         bne     .call
         move.b  _mmc_shift,d3
@@ -328,11 +359,36 @@ _io_wr: cmpa.w  #$2007,a0               ; PPU data port: nametable writes done h
         beq     .done
         move.b  _nes_pad,_pad_shift
         bra     .done
+.ax     move.b  _ax_reg,d3              ; AxROM bank register: 32 KB bank, one-screen page in bit 4
+        move.b  d4,_ax_reg
+        eor.b   d4,d3
+        and.l   #3,d4
+        move.b  d4,_nes_bank
+        moveq   #15,d0
+        lsl.l   d0,d4                   ; bank * $8000
+        lea     _nes_prg_data,a3
+        adda.l  d4,a3
+        move.l  a3,_nes_prg_lo
+        lea     $4000(a3),a4
+        move.l  a4,_nes_prg_hi
+        btst    #4,d3
+        beq.s   .done
+        moveq   #0,d0
+        btst    #4,_ax_reg
+        beq.s   .ax1
+        move.w  #$400,d0
+.ax1    lea     _nt_map,a0
+        move.w  d0,(a0)+
+        move.w  d0,(a0)+
+        move.w  d0,(a0)+
+        move.w  d0,(a0)+
+        bra.s   .done
 .call   move.l  d4,-(sp)
         move.l  a0,-(sp)
         jsr     _nes_write_slow
         addq.l  #8,sp
         move.l  _nes_prg_lo,a3          ; a mapper write may have switched the bank
+        move.l  _nes_prg_hi,a4
 .done   movem.l (sp)+,d0-d1/a0-a1
         move.w  (sp)+,ccr
         rts

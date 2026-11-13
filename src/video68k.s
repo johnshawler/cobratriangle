@@ -5,8 +5,9 @@
 
 ; void tile8(UBYTE *d __asm("a0"), const UBYTE *chr __asm("a1"), ULONG attr __asm("d0"))
 ; One 8x8 NES tile into 4 bitplanes, 64 bytes a line: planes 0-1 from the CHR tile (8 bytes plane 0,
-; 8 bytes plane 1), planes 2-3 filled with the attribute bytes in attr bits 0-7 and 8-15.
-_tile8: movem.l d2-d3/a2-a4,-(sp)
+; 8 bytes plane 1), planes 2-3 the attribute bytes in attr bits 0-7 and 8-15, only under the tile's
+; non-zero pixels: a colour-0 pixel is colour 0 whatever its palette (the NES shows the backdrop there).
+_tile8: movem.l d2-d5/a2-a4,-(sp)
         move.l  _video_plane,d2
         lea     (a0,d2.l),a2
         lea     (a2,d2.l),a3
@@ -14,16 +15,22 @@ _tile8: movem.l d2-d3/a2-a4,-(sp)
         move.w  d0,d1
         lsr.w   #8,d1                   ; plane 3 byte
         moveq   #7,d3
-.l      move.b  8(a1),(a2)
-        move.b  (a1)+,(a0)
-        move.b  d0,(a3)
-        move.b  d1,(a4)
+.l      move.b  8(a1),d4
+        move.b  (a1)+,d5
+        move.b  d5,(a0)
+        move.b  d4,(a2)
+        or.b    d5,d4
+        move.b  d4,d5
+        and.b   d0,d4
+        and.b   d1,d5
+        move.b  d4,(a3)
+        move.b  d5,(a4)
         lea     64(a0),a0
         lea     64(a2),a2
         lea     64(a3),a3
         lea     64(a4),a4
         dbf     d3,.l
-        movem.l (sp)+,d2-d3/a2-a4
+        movem.l (sp)+,d2-d5/a2-a4
         rts
 
 ; void spr_put(UBYTE *e __asm("a0"), UBYTE *o __asm("a1"), const UBYTE *chr __asm("a2"), ULONG ctl __asm("d0"))

@@ -39,6 +39,7 @@ def generate(g):
     FIXED, NORETURN, static_branch, successors = g['FIXED'], g['NORETURN'], g['static_branch'], g['successors']
     wait_kind, rd, outdir = g['wait_kind'], g['rd'], g['outdir']
     reset, nmi, irq, dynamic = g['reset'], g['nmi'], g['irq'], g['dynamic_entries']
+    AX, mapper_write, bank_check, RESET_BANK = g['AX'], g['mapper_write'], g['bank_check'], g['RESET_BANK']
 
     def fname(ctx, a): return 'F%d_%04x' % (ctx_of(ctx, a), a)
     banks_for = collections.defaultdict(list)
@@ -47,6 +48,7 @@ def generate(g):
 
     def callees(ctx, at, t):
         """the functions a JSR at 'at' to t can reach"""
+        if AX: return [(ctx, t)] if (ctx, t) in entries else []
         if t >= 0xc000: return [(FIXED, t)]
         if t < 0x8000: return []
         if ctx != FIXED and at < 0xc000: return [(ctx, t)] if (ctx, t) in entries else []
@@ -75,6 +77,7 @@ def generate(g):
         funcs[(ctx, e)] = dict(ctx=ctx, entry=e, addrs=addrs, aset=aset, info=info)
 
     def tail_fns(ctx, at, t):
+        if AX: return [(ctx, t)] if (ctx, t) in entries else []
         if t >= 0xc000: return [(FIXED, t)]
         if t < 0x8000: return []
         if ctx != FIXED and at < 0xc000: return [(ctx, t)]
@@ -188,6 +191,7 @@ def generate(g):
 
     def call_target(ctx, at, t):
         """label for bsr/jmp to the code at t"""
+        if AX: return fname(ctx, t) if (ctx, t) in entries else dynstub(t)
         if t >= 0xc000: return fname(FIXED, t)
         if t < 0x8000: return dynstub(t)
         if ctx != FIXED and at < 0xc000 and (ctx, t) in entries: return fname(ctx, t)
@@ -273,7 +277,8 @@ def generate(g):
             d = f['info'][a]['d']
             if d and d[1] == 'rel' and d[2] <= a and d[2] in aset:
                 kd = wait_kind(ctx, d[2], a)
-                if kd in ('RAM', 'VBL'): waits[a] = (kd, d[2])
+                if kd in ('RAM', 'VBL', 'IDLE'): waits[a] = (kd, d[2])
+            if d and d[0] == 'JMP' and d[1] == 'abs' and d[2] == a: waits[a] = ('IDLE', a)
         s0 = set()
         for a in addrs:
             d = f['info'][a]['d']
@@ -439,7 +444,8 @@ def generate(g):
                 if a in waits:
                     kd, lp = waits[a]
                     st = newstub()
-                    stubs.append((st, ['lea $%04x.l,a1' % lp, 'bsr _wait_%s' % kd.lower(), 'bra .L%04x' % lp]))
+                    if kd == 'IDLE': stubs.append((st, ['lea $%04x.l,a1' % lp, 'bra _idle']))
+                    else: stubs.append((st, ['lea $%04x.l,a1' % lp, 'bsr _wait_%s' % kd.lower(), 'bra .L%04x' % lp]))
                     tgt = st
                 if sb is True:
                     L.append('bra %s' % tgt)
@@ -474,7 +480,8 @@ def generate(g):
                 keep_c = True
                 fuse = None
             elif m == 'JMP':
-                if mode == 'abs':
+                if a in waits: L += ['lea $%04x.l,a1' % a, 'bra _idle']
+                elif mode == 'abs':
                     L.append(('bra %s' if arg in aset else 'jmp %s') % goto(arg, a))
                 else:
                     hi = (arg & 0xff00) | ((arg + 1) & 0xff)
@@ -494,6 +501,10 @@ def generate(g):
                 push = ['move.w #$%04x,-(a2)' % sw]
                 if el & NZ: push = ['move.w ccr,d6'] + push + ['move.w d6,ccr']
                 L += push + ['bsr %s' % call_target(ctx, a, arg), 'dc.w $%04x' % sw]
+                if bank_check(ctx, arg):            # AxROM: the callee may have left another bank mapped
+                    st = newstub()
+                    stubs.append((st, ['move.w d6,ccr', 'jmp %s' % dynstub((ret + 1) & 0xffff)]))
+                    L += ['move.w ccr,d6', 'cmpa.l #_nes_prg_data+$%x,a3' % (ctx * 0x8000), 'bne %s' % st, 'move.w d6,ccr']
                 nzsrc = None; c68 = None
             elif m == 'RTS':
                 if exit_live[k] & NZ: L += ['move.w ccr,d6', 'movea.l (sp)+,a0', 'cmpm.w (a2)+,(a0)+', 'bne _unwind', 'move.w d6,ccr', 'jmp (a0)']
@@ -504,9 +515,11 @@ def generate(g):
                 L += ['move.w #$%04x,d7' % a, 'bra _fatal_op']
             else:
                 raise ValueError(m)
+            if mapper_write(d):                     # AxROM: the rest runs in the bank just mapped
+                L.append('jmp %s' % dynstub(fall))
             if keep_c is not True and keep_c != 'set': known_c = None
             # fall through into an instruction that is not the next one written
-            ft = bool(i['succ'] and fall in i['succ']) or (fall in i['tails'])
+            ft = (bool(i['succ'] and fall in i['succ']) or (fall in i['tails'])) and not mapper_write(d)
             if ft and m not in ('JMP', 'RTS', 'RTI', 'BRK') and not (m == 'JSR' and arg in NORETURN) and nxt != fall:
                 if mode == 'rel' and static_branch(ctx, a, i['prev']) is True: pass
                 elif fall in aset: L.append('bra .L%04x' % fall)
@@ -547,11 +560,12 @@ def generate(g):
     E('_disp_hash:')
     for sl in slots:
         E('    dc.w 0,0,0,0' if sl is None else '    dc.w $%04x,%d\n    dc.l %s' % (sl[1], sl[0], fname(sl[0], sl[1])))
-    E('_reset_fn: dc.l %s' % fname(FIXED, reset))
-    E('_nmi_fn: dc.l %s' % fname(FIXED, nmi))
+    E('_reset_fn: dc.l %s' % fname(RESET_BANK, reset))
+    E('_nmi_fn: dc.l %s' % fname(RESET_BANK, nmi))
 
     with open(os.path.join(outdir, 'gen68k.s'), 'w') as fo:
         fo.write('; generated by tools/recomp.py (back68k.py) from the game ROM: do not edit\n')
+        fo.write('AXROM = %d\n' % (1 if AX else 0))
         fo.write('    section gencode,code\n')
         fo.write('    xdef _disp_hash,_reset_fn,_nmi_fn\n')
         fo.write('\n'.join(out) + '\n')

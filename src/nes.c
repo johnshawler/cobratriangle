@@ -24,7 +24,7 @@ uint16_t nes_ndirty;
 uint8_t  nes_dirty_flag[0x800];
 uint8_t  nes_redraw_all = 1, nes_pal_dirty = 1;
 
-uint8_t  split_ax;
+uint8_t  split_ax, split_mask, split_pal0;
 uint8_t  split_on, split_ctrl, split_chr0, split_chr1, split_fx, split_line, split_seen;
 uint16_t split_t;
 
@@ -157,7 +157,7 @@ uint8_t nes_read_s0(void)
     if (ppu_s0) {
         split_seen = 1;
         split_ctrl = ppu_ctrl; split_chr0 = mmc_chr0; split_chr1 = mmc_chr1; split_t = ppu_t; split_fx = ppu_fx;
-        split_line = nes_oam[0]; split_ax = ax_reg;
+        split_line = nes_oam[0]; split_ax = ax_reg; split_mask = ppu_mask; split_pal0 = nes_pal[0];
     }
     ppu_vbl = 0; ppu_w = 0; ppu_s0 ^= 1;
     return r;

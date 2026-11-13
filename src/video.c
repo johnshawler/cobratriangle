@@ -1,20 +1,25 @@
-/* video.c - shows the NES picture on the AGA display (Amiga only). Reads the PPU state the game logic left in
- * src/nes.c once per frame and changes only what changed:
+/* video.c - shows the NES picture on the AGA display (Amiga only; tools/vhost.c runs it on the host). Reads the
+ * PPU state the game logic left in src/nes.c once per frame and changes only what changed. Written for Cobra
+ * Triangle (AxROM: one-screen nametables, CHR RAM, a status bar under a sprite-0 split):
  *
- *  - Background: 4 bitplanes = the NES's 16 background colours (attribute bits are planes 2 and 3, so a
- *    palette change is only a colour register write). Hardware scrolling over an unwrapped world: NES tile
- *    columns are drawn into the buffer as the camera reaches them, a few per frame; the 30 tile rows are
- *    drawn twice (y and y + 240) so that the NES's vertical wrap is a plain scroll position. One buffer:
- *    nothing is drawn with the blitter, so nothing has to be erased.
- *  - Sprites: the NES sprites are grouped into clusters at most 64 pixels wide and drawn into 64-pixel
- *    hardware sprites, three attached pairs (15 colours: all four NES sprite palettes) and sprite 6 for
- *    clusters in NES sprite palette 3. Each hardware sprite is reused down the screen (several control
- *    words in one sprite list).
- *  - Raster split: this game only switches the tile set at its sprite-0 split (no scroll change), so tile
- *    rows above the split line are drawn with the upper tile set.
+ *  - Playfield: 4 bitplanes = the NES's 16 background colours (attribute bits are planes 2 and 3, set only under
+ *    non-zero pixels, so colour-0 pixels are colour 0). Hardware scrolling in both axes over an unwrapped
+ *    world: the one-screen nametable is a 256 x 240 torus; tile columns are drawn into the buffer as the camera
+ *    reaches them, and every tile row is kept at y and y + 240, so the vertical wrap is a plain scroll position.
+ *  - CHR RAM: tiles are read from the game's own pattern tables (nes_chr_ram); when the game rewrites a tile,
+ *    the cells that show it are drawn again (and the sprite lists rebuilt).
+ *  - Status bar: the NES shows another nametable page below line 180 (sprite-0 hit, then a timed scroll and
+ *    page change). The kit has no raster split, so the bar is kept as a bitmap and blitted into the scrolling
+ *    buffer right under the playfield view whenever the view moves; the rows it covered are drawn again when
+ *    they come into view. Colour 0 of the bar (its backdrop, black) is drawn as colour 4, which nothing else
+ *    uses, because the playfield's backdrop colour 0 is different.
+ *  - Sprites: NES sprites are grouped into clusters at most 64 pixels wide and drawn into 64-pixel hardware
+ *    sprites, three attached pairs (15 colours) and sprite 6 for clusters in NES sprite palette 3, each reused
+ *    down the screen (several control words in one sprite list).
  */
 #include <proto/exec.h>
 #include <exec/memory.h>
+#include <hardware/custom.h>
 #include <string.h>
 #include "sys.h"
 #include "disp.h"
@@ -22,11 +27,19 @@
 #include "video.h"
 
 #define PLANES   4
-#define LEVEL_W  4096                   /* unwrapped world width: the camera is re-centred if it gets near an end */
+#define LEVEL_W  8192                   /* unwrapped world width: the camera is re-centred if it gets near an end */
 #define VIEW_X   32                     /* the 256-pixel NES picture starts 32 pixels into the 320-pixel view */
 #define SPR_W    64
+#define BUF_H    480                    /* every tile row twice: y and y + 240 */
 
-/* 16-bit big-endian access: a plain word access on the Amiga; byte by byte for the host harness tools/vhost.c */
+/* The status bar, as Cobra Triangle times it (tools/nesref trace of a play frame): sprite-0 hit at line 180,
+   rendering off (backdrop black) until line 193, the bar page's nametable from v = $2000 at line 190. */
+#define BAR_V_LINE   190                /* NES line that shows pixel row 0 of the bar page */
+#define BAR_SHOW     194                /* first NES line with the bar's picture (before it: backdrop) */
+#define BAR_LINES    64                 /* bitmap lines (bar lines are pf_h..239: at most 60) */
+#define BAR_ROWB     64                 /* bytes a bitmap line */
+#define BAR_WORDS    20                 /* blitted words a line: 2 border words, 16 for 256 pixels, 2 border */
+
 #ifdef __m68k__
 #define GETW(p)    (*(UWORD *)(p))
 #define PUTW(p, v) (*(UWORD *)(p) = (UWORD)(v))
@@ -43,9 +56,7 @@ extern uint32_t logic_frames;
 #define VP(i, x) do { x; } while (0)
 #endif
 
-const DispCfg video_display = { PLANES, 1, 0, 240, 480, LEVEL_W, 1, 0, SPR_W, 1 };
-
-extern const uint8_t nes_chr_data[];
+const DispCfg video_display = { PLANES, 1, 0, 240, BUF_H, LEVEL_W, 1, 0, SPR_W, 1 };
 
 static const ULONG nes_rgb[64] = {
 0x666666,0x002a88,0x1412a7,0x3b00a4,0x5c007e,0x6e0040,0x6c0600,0x561d00,0x333500,0x0b4800,0x005200,0x004f08,0x00404d,0,0,0,
@@ -53,15 +64,8 @@ static const ULONG nes_rgb[64] = {
 0xfffeff,0x64b0ff,0x9290ff,0xc676ff,0xf36aff,0xfe6ecc,0xfe8170,0xea9e22,0xbcbe00,0x88d800,0x5ce430,0x45e082,0x48cdde,0x4f4f4f,0,0,
 0xfffeff,0xc0dfff,0xd3d2ff,0xe8c8ff,0xfbc2ff,0xfec4ea,0xfeccc5,0xf7d8a5,0xe4e594,0xcfef96,0xbdf4ab,0xb3f3cc,0xb5ebf2,0xb8b8b8,0,0};
 
-/* ---------------------------------------------------------------- background */
-static LONG cam_ux;                     /* unwrapped world x of NES screen x = 0 */
-static WORD nes_sx_prev = -1;
-static LONG col_lo, col_hi;             /* unwrapped tile columns col_lo..col_hi are drawn (col_lo > col_hi: none) */
-static LONG work_col; static WORD work_row = -1;
-static UBYTE drawn_bgsel, drawn_up0, drawn_up1, drawn_lo0, drawn_lo1, drawn_split;  /* the tile set the buffer holds */
 UBYTE video_flip[256];                  /* bit-reversed bytes, for h-flipped sprites */
 ULONG video_plane;                      /* bytes from one bitplane to the next (src/video68k.s) */
-#define flip_tab video_flip
 #ifdef __m68k__
 void tile8(UBYTE *d __asm("a0"), const UBYTE *chr __asm("a1"), ULONG attr __asm("d0"));
 void spr_put(UBYTE *e __asm("a0"), UBYTE *o __asm("a1"), const UBYTE *chr __asm("a2"), ULONG ctl __asm("d0"));
@@ -69,7 +73,10 @@ void spr_put(UBYTE *e __asm("a0"), UBYTE *o __asm("a1"), const UBYTE *chr __asm(
 static void tile8(UBYTE *d, const UBYTE *chr, ULONG attr)
 {
     int i;
-    for (i = 0; i < 8; i++, d += 64) { d[0] = chr[i]; d[video_plane] = chr[i + 8]; d[2 * video_plane] = (UBYTE)attr; d[3 * video_plane] = (UBYTE)(attr >> 8); }
+    for (i = 0; i < 8; i++, d += 64) {
+        UBYTE m = (UBYTE)(chr[i] | chr[i + 8]);
+        d[0] = chr[i]; d[video_plane] = chr[i + 8]; d[2 * video_plane] = (UBYTE)(attr & m); d[3 * video_plane] = (UBYTE)((attr >> 8) & m);
+    }
 }
 static void spr_put(UBYTE *e, UBYTE *o, const UBYTE *chr, ULONG ctl)
 {
@@ -88,58 +95,64 @@ static void spr_put(UBYTE *e, UBYTE *o, const UBYTE *chr, ULONG ctl)
 }
 #endif
 
-/* tile set for tile row r: upper part above the split line, lower part below */
-static UBYTE split_row;                 /* first tile row drawn with the lower tile set (30 = no split) */
-static UBYTE up0, up1, lo0, lo1, bgsel;
+/* ---------------------------------------------------------------- playfield */
+static LONG cam_ux;                     /* unwrapped world x of NES screen x = 0 */
+static WORD sx_prev = -1;
+static LONG col_lo, col_hi;             /* unwrapped tile columns col_lo..col_hi are drawn (col_lo > col_hi: none) */
+static LONG work_col; static WORD work_row = -1;
+static UWORD pf_page;                   /* nes_vram offset of the playfield's one-screen page: 0 or $400 */
+static UBYTE bgsel;                     /* background pattern table: 0 = $0000, 1 = $1000 */
+static UBYTE drawn_bgsel = 0xff; static UWORD drawn_page = 0xffff;
+static int pf_h = 240;                  /* playfield lines: the split line, or 240 */
+static int cur_sy;                      /* the vertical scroll being drawn for */
+static UBYTE mask_left;                 /* PPUMASK of the playfield: bit 1 clear hides the left 8 pixels */
 
-static const UBYTE *chr_tile(UBYTE tile, int row)
+static const UBYTE *bg_chr(UBYTE tile) { return nes_chr + (bgsel ? 0x1000 : 0) + tile * 16; }
+static UWORD nt_cell(LONG uc, int r) { return (UWORD)(pf_page | (r << 5) | (uc & 31)); }
+
+/* Columns outside the 256-pixel NES picture are drawn in colour 4 (black, like the NES's border): their
+   nametable content belongs to the other side of the wrap. */
+static UBYTE colstate[64];              /* by unwrapped column & 63: 1 drawn from the nametable, 2 drawn blank */
+static int col_visible(LONG uc) { LONG x = uc * 8; return x + 8 > cam_ux + ((mask_left & 2) ? 0 : 8) && x < cam_ux + 256; }
+
+/* rowcopies[r]: bit 0 = the copy at y = 8r is up to date, bit 1 = the copy at y = 8r + 240 */
+static UBYTE rowcopies[30];
+static UBYTE row_need(int r, int sy)
 {
-    UWORD a = (UWORD)((bgsel ? 0x1000 : 0) + tile * 16);
-    UBYTE b0 = row < split_row ? up0 : lo0, b1 = row < split_row ? up1 : lo1, bank;
-    if (mmc_ctrl & 0x10) bank = (a < 0x1000) ? b0 : b1;
-    else bank = (UBYTE)((b0 & 0x1e) | (a >> 12));
-    return nes_chr_data + (ULONG)(bank & 31) * 0x1000 + (a & 0xfff);
+    int y0 = 8 * r, y1 = 8 * r + 240;
+    return (UBYTE)(((y0 + 8 > sy && y0 < sy + pf_h) ? 1 : 0) | ((y1 + 8 > sy && y1 < sy + pf_h) ? 2 : 0));
 }
 
-/* nametable cell of unwrapped column uc, row r (vertical mirroring: two nametables side by side) */
-static UWORD nt_cell(LONG uc, int r) { return (UWORD)((((uc >> 5) & 1) << 10) | (r << 5) | (uc & 31)); }
-
-/* Columns in the 32-pixel borders beside the 256-pixel NES picture are drawn in the backdrop colour: the NES
-   never shows them, and their nametable content belongs to the other side of the wrap. */
-static UBYTE colstate[64];              /* by unwrapped column & 63: 1 drawn from the nametable, 2 drawn blank */
-/* the NES hides its leftmost 8 pixels when PPUMASK bit 1 is clear: the game streams new columns there */
-static int col_visible(LONG uc) { LONG x = uc * 8; return x + 8 > cam_ux + ((ppu_mask & 2) ? 0 : 8) && x < cam_ux + 256; }
-
-/* Each tile row is in the buffer twice (y and y + 240) so that any vertical scroll shows 240 contiguous lines,
-   but only the copies the current scroll shows are kept up to date: rowcopies[r] bit 0 = the copy at y,
-   bit 1 = the copy at y + 240. When the scroll brings the other copy into view, that row is drawn again. */
-static UBYTE rowcopies[30];
-static UBYTE row_need(int r, int sy) { return (UBYTE)((8 * r + 8 > sy ? 1 : 0) | (8 * r < sy ? 2 : 0)); }
-
-static void draw_tile_copies(LONG uc, int r, UBYTE copies);
-static void draw_tile(LONG uc, int r) { draw_tile_copies(uc, r, rowcopies[r]); }
+static void blank8(UBYTE *d)
+{
+    int i;
+    for (i = 0; i < 8; i++, d += 64) { d[0] = 0; d[video_plane] = 0; d[2 * video_plane] = 0xff; d[3 * video_plane] = 0; }
+}
 
 static void draw_tile_copies(LONG uc, int r, UBYTE copies)
 {
-    UWORD cell = nt_cell(uc, r), base = cell & 0x400;
+    UWORD cell = nt_cell(uc, r);
     UBYTE tile = nes_vram[cell], tx = (UBYTE)(uc & 31);
-    UBYTE attr = nes_vram[base | 0x3c0 | ((r >> 2) << 3) | (tx >> 2)];
+    UBYTE attr = nes_vram[pf_page | 0x3c0 | ((r >> 2) << 3) | (tx >> 2)];
     UBYTE pal = (UBYTE)((attr >> (((r & 2) << 1) | (tx & 2))) & 3);
-    const UBYTE *src = chr_tile(tile, r);
     UBYTE p2 = (pal & 1) ? 0xff : 0, p3 = (pal & 2) ? 0xff : 0;
     LONG x = uc * 8;
     UBYTE *d;
-    if (x < -64 || x >= LEVEL_W + 320) return;
-    if (colstate[uc & 63] == 2) { static const UBYTE blank[16]; src = blank; p2 = p3 = 0; }   /* a border column */
+    if (x < -64 || x >= LEVEL_W + 320 || !copies) return;
 #ifdef LOGIC_TRACE
     { extern ULONG vtiles; vtiles++; }
 #endif
     d = disp_front + (ULONG)(r * 8) * 64 + ((x + disp_margin) >> 3);
-    if (copies & 1) tile8(d, src, (ULONG)(p3 << 8 | p2));
-    if (copies & 2) tile8(d + 240 * 64, src, (ULONG)(p3 << 8 | p2));     /* the copy for the vertical wrap */
+    if (colstate[uc & 63] == 2) {
+        if (copies & 1) blank8(d);
+        if (copies & 2) blank8(d + 240 * 64);
+        return;
+    }
+    if (copies & 1) tile8(d, bg_chr(tile), (ULONG)(p3 << 8 | p2));
+    if (copies & 2) tile8(d + 240 * 64, bg_chr(tile), (ULONG)(p3 << 8 | p2));
 }
+static void draw_tile(LONG uc, int r) { draw_tile_copies(uc, r, rowcopies[r]); }
 
-/* the visible column range for the current camera, with a margin */
 static void want_cols(LONG *lo, LONG *hi)
 {
     *lo = (cam_ux - VIEW_X - 8) >> 3;
@@ -179,8 +192,7 @@ static void stream_cols(int n)
             work_row = 0;
             colstate[work_col & 63] = col_visible(work_col) ? 1 : 2;
         }
-        draw_tile(work_col, work_row);
-        n--;
+        if (rowcopies[work_row]) { draw_tile(work_col, work_row); n--; }
         if (++work_row == 30) {
             if (work_col > col_hi) col_hi = work_col; else col_lo = work_col;
             work_row = -1;
@@ -193,54 +205,151 @@ static void fix_edges(void)
 {
     LONG uc;
     int r;
-    for (uc = col_lo; uc <= col_hi; uc++)            /* blank columns that came into the picture; columns that */
-        if (colstate[uc & 63] == 2 && col_visible(uc)) { /* left it keep their (correct) content                */
-            colstate[uc & 63] = 1;
+    for (uc = col_lo; uc <= col_hi; uc++) {
+        UBYTE want = col_visible(uc) ? 1 : 2;
+        if (colstate[uc & 63] != want) {
+            colstate[uc & 63] = want;
             for (r = 0; r < 30; r++) draw_tile(uc, r);
         }
+    }
 }
 
-/* the NES changed nametable cell i: redraw it where it is on screen (or the 16 tiles of an attribute cell) */
-static int redraw_cell(UWORD i)
+/* the NES changed playfield nametable cell i: redraw it where it is on screen (or the 16 tiles of an attribute cell) */
+static void redraw_cell(UWORD i)
 {
-    LONG uc0 = col_lo, uc;
-    int r, c, cnt = 0;
+    LONG uc;
+    int r, c;
     if ((i & 0x3ff) < 0x3c0) {
-        int cx = i & 31, row = (i >> 5) & 31, ntx = (i >> 10) & 1;
-        for (uc = uc0 + ((((ntx << 5) | cx) - uc0) & 63); uc <= col_hi; uc += 64)
-            if (col_visible(uc)) { draw_tile(uc, row); cnt++; }       /* the border is not updated */
-        if (work_row > row) { uc = work_col; if ((uc & 63) == ((ntx << 5) | cx) && col_visible(uc)) { draw_tile(uc, row); cnt++; } }
+        int cx = i & 31, row = (i >> 5) & 31;
+        if (row >= 30) return;
+        for (uc = col_lo + ((cx - col_lo) & 31); uc <= col_hi; uc += 32) draw_tile(uc, row);
+        if (work_row > row && (work_col & 31) == cx) draw_tile(work_col, row);
     } else {
-        int a = i & 0x3f, ntx = (i >> 10) & 1, ax = (a & 7) * 4, ay = (a >> 3) * 4;
-        for (c = 0; c < 4; c++)
-            for (uc = uc0 + ((((ntx << 5) | (ax + c)) - uc0) & 63); uc <= col_hi; uc += 64)
-                if (col_visible(uc))
-                    for (r = ay; r < ay + 4 && r < 30; r++) { draw_tile(uc, r); cnt++; }
+        int a = i & 0x3f, ax = (a & 7) * 4, ay = (a >> 3) * 4;
+        for (c = 0; c < 4; c++) {
+            for (uc = col_lo + ((ax + c - col_lo) & 31); uc <= col_hi; uc += 32)
+                for (r = ay; r < ay + 4 && r < 30; r++) draw_tile(uc, r);
+            if ((work_col & 31) == ax + c)
+                for (r = ay; r < ay + 4 && r < 30 && r < work_row; r++) draw_tile(work_col, r);
+        }
     }
-    return cnt;
+}
+
+/* the game rewrote background tile t (0..255 in the background pattern table): redraw the cells showing it */
+static void redraw_tile(UBYTE t)
+{
+    int i;
+    const UBYTE *v = nes_vram + pf_page;
+    for (i = 0; i < 960; i++) if (v[i] == t) redraw_cell((UWORD)(pf_page | i));
+}
+
+/* ---------------------------------------------------------------- status bar */
+static UBYTE *bar_bm;                   /* chip RAM: 4 planes x BAR_LINES x BAR_ROWB; line k = NES line pf_h + k */
+#define BAR_PLANE ((ULONG)BAR_LINES * BAR_ROWB)
+static UWORD bar_page;
+static int bar_valid, bar_drawn_h;
+static LONG bar_x = -1; static int bar_y = -1, bar_h;
+
+/* the bar bitmap from the bar page: 2 border words each side, colour 0 drawn as colour 4 */
+static void render_bar(void)
+{
+    int r, c, k, p, top = pf_h;
+    UBYTE *b;
+    for (p = 0; p < 4; p++) memset(bar_bm + p * BAR_PLANE, p == 2 ? 0xff : 0, BAR_PLANE);
+    for (r = 0; r < 8; r++)
+        for (c = 0; c < 32; c++) {
+            UWORD cell = (UWORD)(bar_page | (r << 5) | c);
+            UBYTE attr = nes_vram[bar_page | 0x3c0 | ((r >> 2) << 3) | (c >> 2)];
+            UBYTE pal = (UBYTE)((attr >> (((r & 2) << 1) | (c & 2))) & 3);
+            const UBYTE *chr = bg_chr(nes_vram[cell]);
+            for (k = 0; k < 8; k++) {
+                int line = BAR_V_LINE + r * 8 + k - top;          /* bitmap line of NES line BAR_V_LINE + 8r + k */
+                UBYTE p0 = chr[k], p1 = chr[k + 8], m = (UBYTE)(p0 | p1);
+                if (line + top < BAR_SHOW || line < 0 || line >= BAR_LINES) continue;
+                b = bar_bm + line * BAR_ROWB + 4 + c;
+                b[0] = p0; b[BAR_PLANE] = p1;
+                b[2 * BAR_PLANE] = (pal & 1) ? 0xff : (UBYTE)~m;   /* colour 0 -> colour 4 */
+                b[3 * BAR_PLANE] = (pal & 2) ? m : 0;
+            }
+        }
+    bar_drawn_h = 240 - top;
+}
+
+#ifdef __m68k__
+static void blit_bar(LONG wx, int wy, int lines)
+{
+    volatile struct Custom *cu = (volatile struct Custom *)0xdff000;
+    ULONG bx = (ULONG)(wx - 32 + disp_margin), off = (ULONG)wy * 64 + ((bx >> 3) & ~1UL);
+    UWORD sh = (UWORD)(bx & 15);
+    int p;
+    for (p = 0; p < 4; p++) {
+        blit_wait();
+        cu->bltcon0 = (UWORD)(0x09f0 | (sh << 12));
+        cu->bltcon1 = 0;
+        cu->bltafwm = 0xffff; cu->bltalwm = 0xffff;
+        cu->bltapt = bar_bm + p * BAR_PLANE;
+        cu->bltdpt = disp_front + p * disp_plane + off;
+        cu->bltamod = BAR_ROWB - 2 * BAR_WORDS;
+        cu->bltdmod = 64 - 2 * BAR_WORDS;
+        cu->bltsize = (UWORD)((lines << 6) | BAR_WORDS);
+    }
+}
+#else                                   /* the same copy in C, for the host harness tools/vhost.c */
+static void blit_bar(LONG wx, int wy, int lines)
+{
+    ULONG bx = (ULONG)(wx - 32 + disp_margin);
+    int p, l, x;
+    for (p = 0; p < 4; p++)
+        for (l = 0; l < lines; l++)
+            for (x = 0; x < BAR_WORDS * 16; x++) {
+                UBYTE *s = bar_bm + p * BAR_PLANE + l * BAR_ROWB, *d = disp_front + p * disp_plane + (ULONG)(wy + l) * 64;
+                ULONG dx = bx + x;
+                int bit = (s[x >> 3] >> (7 - (x & 7))) & 1;
+                d[dx >> 3] = (UBYTE)((d[dx >> 3] & ~(0x80 >> (dx & 7))) | (bit << (7 - (dx & 7))));
+            }
+}
+#endif
+
+static void bar_frame(int sy, int moved)
+{
+    int r, y0 = sy + pf_h, y1 = sy + 240;
+    if (!moved && bar_x == cam_ux && bar_y == sy && bar_h == pf_h) return;
+    if (!bar_valid || bar_drawn_h != 240 - pf_h) { render_bar(); bar_valid = 1; }
+    blit_bar(cam_ux, y0, y1 - y0);
+    bar_x = cam_ux; bar_y = sy; bar_h = pf_h;
+    for (r = 0; r < 30; r++) {                          /* the row copies the bar covered must be drawn again */
+        if (8 * r + 8 > y0 && 8 * r < y1) rowcopies[r] &= (UBYTE)~1;
+        if (8 * r + 248 > y0 && 8 * r + 240 < y1) rowcopies[r] &= (UBYTE)~2;
+    }
 }
 
 /* ---------------------------------------------------------------- sprites */
+/* Hardware sprites 0-6 (fetch 0). A cluster of NES sprites in one NES palette p goes into sprite 2p or 2p+1
+   alone (3 colours: colours 16+4p+1..3 are that palette); a cluster in several palettes into an attached pair
+   (0/1, 2/3, 4/5: 15 colours). Each hardware sprite is reused down the screen, a segment per cluster, with
+   at least one free line between segments. */
 #define NSEG    24
 #define MAXIN   64
-typedef struct { WORD x0, x1, y0, y1; UBYTE n, pal3only; UBYTE idx[MAXIN]; } Group;
+typedef struct { WORD x0, x1, y0, y1; UBYTE n, pals; BYTE se, so; UWORD oe, oo; UBYTE idx[MAXIN]; } Group;
 static Group grp[64];
 static int ngrp;
-typedef struct { Group *seg[NSEG]; int n; } Chan;
-static Chan chan[4];                    /* 0..2: attached pairs (sprites 0/1, 2/3, 4/5), 3: sprite 6 */
+static Group *hseg[7][NSEG];            /* the clusters of each hardware sprite, top to bottom */
+static int hn[7];
 #define SPR_BYTES (16 * (240 + 2 * NSEG + 4))
 static UBYTE *spr_mem[2][7];            /* two sets of sprite lists, swapped every frame */
 static int spr_set;
 int video_sprites_dropped;
+static int spr_split;                   /* under a split, sprite 0 only marks it and the bar shows from BAR_SHOW */
 
 static void build_groups(void)
 {
     int i, j, k;
     ngrp = 0;
-    for (i = 0; i < 64; i++) {
+    for (i = spr_split ? 1 : 0; i < 64; i++) {
         UBYTE y = nes_oam[i * 4], x = nes_oam[i * 4 + 3];
         WORD sy = (WORD)y + 1;
         if (y >= 0xef) continue;
+        if (spr_split && sy + 8 > pf_h && sy + 4 < BAR_SHOW) continue;   /* in the blank lines between */
         for (j = ngrp > 4 ? ngrp - 4 : 0; j < ngrp; j++) {   /* a metasprite's sprites come together in OAM */
             Group *g = &grp[j];
             WORD nx0 = x < g->x0 ? x : g->x0, nx1 = x + 8 > g->x1 ? x + 8 : g->x1;
@@ -250,18 +359,17 @@ static void build_groups(void)
             if (sy < g->y0) g->y0 = sy;
             if (sy + 8 > g->y1) g->y1 = sy + 8;
             g->idx[g->n++] = (UBYTE)i;
-            if ((nes_oam[i * 4 + 2] & 3) != 3) g->pal3only = 0;
+            g->pals |= (UBYTE)(1 << (nes_oam[i * 4 + 2] & 3));
             break;
         }
         if (j >= ngrp) {
             Group *g = &grp[ngrp++];
             g->x0 = x; g->x1 = x + 8; g->y0 = sy; g->y1 = sy + 8; g->n = 1; g->idx[0] = (UBYTE)i;
-            g->pal3only = (nes_oam[i * 4 + 2] & 3) == 3;
+            g->pals = (UBYTE)(1 << (nes_oam[i * 4 + 2] & 3));
         }
     }
-    /* merge groups that touch, while they fit */
-    for (i = 0; i < ngrp; i++)
-        for (j = i + 1; j < ngrp && j <= i + 6; j++) {   /* neighbours in OAM order only */
+    for (i = 0; i < ngrp; i++)                          /* merge groups that touch and share a palette, while they fit */
+        for (j = i + 1; j < ngrp && j <= i + 6; j++) {
             Group *a = &grp[i], *b = &grp[j];
             WORD nx0 = a->x0 < b->x0 ? a->x0 : b->x0, nx1 = a->x1 > b->x1 ? a->x1 : b->x1;
             if (nx1 - nx0 > SPR_W || a->n + b->n > MAXIN) continue;
@@ -270,24 +378,21 @@ static void build_groups(void)
             if (b->y0 < a->y0) a->y0 = b->y0;
             if (b->y1 > a->y1) a->y1 = b->y1;
             for (k = 0; k < b->n; k++) a->idx[a->n++] = b->idx[k];
-            a->pal3only &= b->pal3only;
-            grp[j] = grp[--ngrp]; j--;              /* look at the group moved into slot j */
+            a->pals |= b->pals;
+            grp[j] = grp[--ngrp]; j--;
         }
 }
 
-static int try_place(Chan *c, Group *g)
+static int fits(int n, Group *g)
 {
-    if (c->n >= NSEG) return 0;
-    if (c->n && c->seg[c->n - 1]->y1 + 1 > g->y0) return 0;
-    c->seg[c->n++] = g;
-    return 1;
+    return hn[n] < NSEG && (!hn[n] || hseg[n][hn[n] - 1]->y1 + 1 <= g->y0);
 }
 
 static void assign(void)
 {
-    int i, j, k;
+    int i, j, k, n;
     Group *order[64];
-    for (i = 0; i < 4; i++) chan[i].n = 0;
+    for (i = 0; i < 7; i++) hn[i] = 0;
     for (i = 0; i < ngrp; i++) order[i] = &grp[i];
     for (i = 1; i < ngrp; i++) {                      /* by top line */
         Group *t = order[i];
@@ -296,13 +401,25 @@ static void assign(void)
     }
     for (i = 0; i < ngrp; i++) {
         Group *g = order[i];
-        if (g->pal3only && try_place(&chan[3], g)) continue;
-        for (k = 0; k < 3; k++) if (try_place(&chan[k], g)) break;
-        if (k == 3) video_sprites_dropped++;
+        g->se = g->so = -1;
+        if (!(g->pals & (g->pals - 1))) {               /* one palette: a sprite of its own colours */
+            int p = g->pals == 1 ? 0 : g->pals == 2 ? 1 : g->pals == 4 ? 2 : 3;
+            for (n = 2 * p; n <= 2 * p + 1 && n <= 6; n++)
+                if (fits(n, g)) { hseg[n][hn[n]++] = g; g->se = (BYTE)n; break; }
+            if (g->se >= 0) continue;
+        }
+        for (k = 0; k < 3; k++)
+            if (fits(2 * k, g) && fits(2 * k + 1, g)) {
+                hseg[2 * k][hn[2 * k]++] = g; hseg[2 * k + 1][hn[2 * k + 1]++] = g;
+                g->se = (BYTE)(2 * k); g->so = (BYTE)(2 * k + 1);
+                break;
+            }
+        if (g->se < 0) video_sprites_dropped++;
     }
 }
 
-/* draw the NES sprites of group g into one segment's lines: e = even sprite lines, o = odd sprite lines */
+static const UBYTE *spr_chr(UBYTE tile) { return nes_chr + ((ppu_ctrl & 0x08) ? 0x1000 : 0) + tile * 16; }
+
 static void render_group(Group *g, UBYTE *e, UBYTE *o)
 {
     int k;
@@ -310,13 +427,7 @@ static void render_group(Group *g, UBYTE *e, UBYTE *o)
         int i = g->idx[k];
         UBYTE tile = nes_oam[i * 4 + 1], at = nes_oam[i * 4 + 2];
         int dx = nes_oam[i * 4 + 3] - g->x0, dy = nes_oam[i * 4] + 1 - g->y0;
-        int upper = split_on && (int)nes_oam[i * 4] + 1 <= split_line;      /* sprites above the split: upper tile set */
-        UBYTE c0 = upper ? split_chr0 : mmc_chr0, c1 = upper ? split_chr1 : mmc_chr1, ctl = upper ? split_ctrl : ppu_ctrl;
-        UWORD a = (UWORD)(((ctl & 0x08) ? 0x1000 : 0) + tile * 16), bank;
-        const UBYTE *src;
-        bank = (mmc_ctrl & 0x10) ? ((a < 0x1000) ? c0 : c1) : ((c0 & 0x1e) | (a >> 12));
-        src = nes_chr_data + (ULONG)(bank & 31) * 0x1000 + (a & 0xfff);
-        spr_put(e + dy * 16, o ? o + dy * 16 : e, src,
+        spr_put(e + dy * 16, o ? o + dy * 16 : e, spr_chr(tile),
                 (ULONG)(dx | ((at & 0x40) << 2) | ((at & 0x80) << 2) | ((at & 3) << 10) | (o ? 0x1000 : 0)));
     }
 }
@@ -329,10 +440,10 @@ static void clear_lines(UBYTE *p, int n)
 
 static UBYTE scr_e[16 * 256], scr_o[16 * 256];    /* one segment is put together here (fast RAM if there is any) */
 
-/* Segments drawn last frame, by content: a group with the same sprites, tiles, attributes and layout is copied
-   from the previous set of sprite lists (which stays untouched while this set is built) instead of drawn. */
+/* Segments drawn last frame, by content: a cluster with the same sprites, tiles, attributes and layout is
+   copied from the previous set of sprite lists (which stays untouched while this set is built). */
 typedef struct { ULONG sig; UWORD n; UBYTE *e, *o; } Cached;
-static Cached cache[2][4 * NSEG];
+static Cached cache[2][64];
 static int ncache[2];
 
 static ULONG group_sig(Group *g, int with_o)
@@ -341,10 +452,9 @@ static ULONG group_sig(Group *g, int with_o)
     int k;
     for (k = 0; k < g->n; k++) {
         int i = g->idx[k];
-        int upper = split_on && (int)nes_oam[i * 4] + 1 <= split_line;
         ULONG v = ((ULONG)nes_oam[i * 4 + 1] << 24) | ((ULONG)nes_oam[i * 4 + 2] << 16)
                 | ((ULONG)(UBYTE)(nes_oam[i * 4 + 3] - g->x0) << 8) | (UBYTE)(nes_oam[i * 4] + 1 - g->y0);
-        h = (h ^ v ^ (ULONG)upper) * 16777619UL + (ULONG)k;
+        h = (h ^ v) * 16777619UL + (ULONG)k;
     }
     return h;
 }
@@ -355,67 +465,73 @@ static void copy_lines(UBYTE *d, const UBYTE *s, int n)
     for (n >>= 4; n; n--) { l[0] = m[0]; l[1] = m[1]; l[2] = m[2]; l[3] = m[3]; l += 4; m += 4; }
 }
 
+static void put_ctl(UWORD n, UBYTE *d, Group *g, int att)
+{
+    WORD x = (WORD)(g->x0 + VIEW_X), y = g->y0, h = (WORD)(g->y1 - g->y0);
+    UWORD hs = (UWORD)(x + 0x80), vs = (UWORD)(y + 0x34), ve = (UWORD)(vs + h);
+    if (d == spr_mem[spr_set][n]) { disp_sprite(n, (UWORD *)d, x, y, (UWORD)h, (UWORD)att); return; }   /* the first: the kit */
+    PUTW(d, ((vs & 0xff) << 8) | ((hs >> 1) & 0xff));
+    PUTW(d + 8, ((ve & 0xff) << 8) | (att ? 0x80 : 0) | (((vs >> 8) & 1) << 2) | (((ve >> 8) & 1) << 1) | (hs & 1));
+}
+
 static void build_sprites(void)
 {
     int k, s, n;
+    UWORD off;
     spr_set ^= 1;
     ncache[spr_set] = 0;
     VP(3, { build_groups(); assign(); });
-    for (k = 0; k < 4; k++) {
-        Chan *c = &chan[k];
-        int ne = k < 3 ? k * 2 : 6, no = k < 3 ? k * 2 + 1 : -1;
-        UBYTE *e = spr_mem[spr_set][ne], *o = no >= 0 ? spr_mem[spr_set][no] : 0;
-        if (!c->n) { disp_sprite_off((UWORD)ne); if (no >= 0) disp_sprite_off((UWORD)no); continue; }
-        for (s = 0; s < c->n; s++) {
-            Group *g = c->seg[s];
-            WORD x = (WORD)(g->x0 + VIEW_X), y = g->y0, h = (WORD)(g->y1 - g->y0);
-            UWORD hs = (UWORD)(x + 0x80), vs = (UWORD)(y + 0x34), ve = (UWORD)(vs + h);
-            n = h * 16;
-            if (s == 0) {                       /* the first control words: the kit writes them */
-                disp_sprite((UWORD)ne, (UWORD *)e, x, y, (UWORD)h, 0);
-                if (o) disp_sprite((UWORD)no, (UWORD *)o, x, y, (UWORD)h, 1);
-            } else {
-                PUTW(e, ((vs & 0xff) << 8) | ((hs >> 1) & 0xff));
-                PUTW(e + 8, ((ve & 0xff) << 8) | (((vs >> 8) & 1) << 2) | (((ve >> 8) & 1) << 1) | (hs & 1));
-                if (o) { PUTW(o, GETW(e)); PUTW(o + 8, GETW(e + 8) | 0x80); }
-            }
-            {   ULONG sig = group_sig(g, o != 0);
-                Cached *cp = cache[spr_set ^ 1], *hit = 0;
-                int j;
-                for (j = 0; j < ncache[spr_set ^ 1]; j++) if (cp[j].sig == sig && cp[j].n == n) { hit = &cp[j]; break; }
-                if (hit) {
-                    copy_lines(e + 16, hit->e, n);
-                    if (o) copy_lines(o + 16, hit->o, n);
-                } else {
-                    clear_lines(scr_e, n);
-                    if (o) clear_lines(scr_o, n);
-                    render_group(g, scr_e, o ? scr_o : 0);
-                    copy_lines(e + 16, scr_e, n);       /* chip RAM is only written, once, a long at a time */
-                    if (o) copy_lines(o + 16, scr_o, n);
-                }
-                if (ncache[spr_set] < 4 * NSEG) {
-                    Cached *c2 = &cache[spr_set][ncache[spr_set]++];
-                    c2->sig = sig; c2->n = (UWORD)n; c2->e = e + 16; c2->o = o ? o + 16 : 0;
-                }
-            }
-            e += 16 + n;
-            if (o) o += 16 + n;
+    for (k = 0; k < 7; k++) {                           /* where each segment goes in its sprite's list */
+        off = 0;
+        for (s = 0; s < hn[k]; s++) {
+            Group *g = hseg[k][s];
+            if (g->se == k) g->oe = off; else g->oo = off;
+            off = (UWORD)(off + 16 + (g->y1 - g->y0) * 16);
         }
-        memset(e, 0, 16);                       /* end of the list */
-        if (o) memset(o, 0, 16);
+        if (!hn[k]) disp_sprite_off((UWORD)k);
+        else memset(spr_mem[spr_set][k] + off, 0, 16);  /* end of the list */
+    }
+    for (k = 0; k < ngrp; k++) {
+        Group *g = &grp[k];
+        UBYTE *e, *o;
+        ULONG sig;
+        Cached *cp = cache[spr_set ^ 1], *hit = 0;
+        int j;
+        if (g->se < 0) continue;
+        n = (g->y1 - g->y0) * 16;
+        e = spr_mem[spr_set][g->se] + g->oe;
+        o = g->so >= 0 ? spr_mem[spr_set][g->so] + g->oo : 0;
+        put_ctl((UWORD)g->se, e, g, 0);
+        if (o) put_ctl((UWORD)g->so, o, g, 1);
+        sig = group_sig(g, o != 0);
+        for (j = 0; j < ncache[spr_set ^ 1]; j++) if (cp[j].sig == sig && cp[j].n == n) { hit = &cp[j]; break; }
+        if (hit) {
+            copy_lines(e + 16, hit->e, n);
+            if (o) copy_lines(o + 16, hit->o, n);
+        } else {
+            clear_lines(scr_e, n);
+            if (o) clear_lines(scr_o, n);
+            render_group(g, scr_e, o ? scr_o : 0);
+            copy_lines(e + 16, scr_e, n);           /* chip RAM is only written, once, a long at a time */
+            if (o) copy_lines(o + 16, scr_o, n);
+        }
+        if (ncache[spr_set] < 64) {
+            Cached *c2 = &cache[spr_set][ncache[spr_set]++];
+            c2->sig = sig; c2->n = (UWORD)n; c2->e = e + 16; c2->o = o ? o + 16 : 0;
+        }
     }
 }
 
 /* ---------------------------------------------------------------- frame */
 static ULONG pal_rgb[32];
-static UBYTE spr_valid;
-static UBYTE was_on;
+static UBYTE spr_valid, was_on, last_pal0;
 
-static void set_palette(int on)
+static void set_palette(int on, UBYTE pal0)
 {
     int i;
     for (i = 0; i < 32; i++) {
-        UBYTE c = (i & 3) ? nes_pal[i] : nes_pal[0];
+        UBYTE c = (i & 3) ? nes_pal[i] : nes_pal[0];   /* 4, 8, 12: the backdrop below the split (the bar's colour 0) */
+        if (i == 0) c = pal0;
         pal_rgb[i] = on ? nes_rgb[c & 0x3f] : 0;
     }
     disp_palette(pal_rgb, 0, 32);
@@ -424,10 +540,11 @@ static void set_palette(int on)
 int video_load(void)
 {
     int i, j;
-    for (i = 0; i < 256; i++) { UBYTE r = 0; for (j = 0; j < 8; j++) if (i & (1 << j)) r |= (UBYTE)(0x80 >> j); flip_tab[i] = r; }
+    for (i = 0; i < 256; i++) { UBYTE r = 0; for (j = 0; j < 8; j++) if (i & (1 << j)) r |= (UBYTE)(0x80 >> j); video_flip[i] = r; }
     for (i = 0; i < 2; i++)
         for (j = 0; j < 7; j++)
             if (!(spr_mem[i][j] = sys_alloc(SPR_BYTES, MEMF_CHIP | MEMF_CLEAR))) return 0;
+    if (!(bar_bm = sys_alloc(4 * BAR_PLANE, MEMF_CHIP | MEMF_CLEAR))) return 0;
     video_plane = 0;
     invalidate();
     return 1;
@@ -437,73 +554,91 @@ void video_start(void)
 {
     video_plane = disp_plane;
     cam_ux = LEVEL_W / 2;
-    nes_sx_prev = -1;
+    sx_prev = -1;
     invalidate();
 }
 
-
 void video_frame(void)
 {
-    int on = (ppu_mask & 0x18) != 0, budget = 0, i;
+    int split = split_on, i, budget, bar_dirty = 0, spr_chr_dirty = 0;
+    UBYTE ctl = split ? split_ctrl : ppu_ctrl, mask = split ? split_mask : ppu_mask;
+    UWORD t = split ? split_t : ppu_t, page = (UWORD)((((split ? split_ax : ax_reg) & 0x10) ? 0x400 : 0));
+    UBYTE fx = split ? split_fx : ppu_fx, pal0 = split ? split_pal0 : nes_pal[0];
+    int on = (mask & 0x18) != 0;
+    WORD sx = (WORD)(((t & 0x1f) << 3) | fx);
+    int sy = ((((t >> 5) & 0x1f) * 8) + ((t >> 12) & 7)) % 240;
     LONG vlo, vhi;
-    WORD sx = (WORD)((((ppu_t & 0x1f) << 3) | ppu_fx) + ((ppu_t >> 10) & 1) * 256);
-    WORD sy = (WORD)((((ppu_t >> 5) & 0x1f) * 8 + ((ppu_t >> 12) & 7)) % 240);
-    UBYTE nsplit;
 
-    /* camera: follow the NES scroll by its change since the last frame (it wraps at 512) */
-    if (nes_sx_prev >= 0) {
-        WORD d = (WORD)((sx - nes_sx_prev) & 511);
-        if (d >= 256) d -= 512;
+    pf_h = split ? (split_line + 2 > 240 ? 240 : split_line + 2) : 240;
+    spr_split = split;
+    mask_left = mask;
+    cur_sy = sy;
+    /* camera: follow the NES scroll by its change since the last frame (one screen: it wraps at 256) */
+    if (sx_prev >= 0) {
+        WORD d = (WORD)((sx - sx_prev) & 255);
+        if (d >= 128) d -= 256;
         cam_ux += d;
     } else cam_ux = LEVEL_W / 2 + sx;
-    nes_sx_prev = sx;
-    if (cam_ux < 256 || cam_ux > LEVEL_W - 512) { cam_ux = LEVEL_W / 2 + sx; invalidate(); }
+    sx_prev = sx;
+    if (cam_ux < 256 || cam_ux > LEVEL_W - 512) { cam_ux = LEVEL_W / 2 + (sx & 255); invalidate(); }
 
-    /* which tile set each row uses; a change means everything is drawn again */
-    bgsel = (ppu_ctrl & 0x10) != 0;
-    if (split_on) {
-        nsplit = (UBYTE)((split_line + 1 + 7) >> 3);
-        up0 = split_chr0; up1 = split_chr1; lo0 = mmc_chr0; lo1 = mmc_chr1;
-        bgsel = (split_ctrl & 0x10) != 0;
-    } else {
-        nsplit = 30; up0 = lo0 = mmc_chr0; up1 = lo1 = mmc_chr1;
+    bgsel = (ctl & 0x10) != 0;
+    pf_page = page;
+    if (nes_redraw_all || bgsel != drawn_bgsel || page != drawn_page) {
+        drawn_bgsel = bgsel; drawn_page = page; nes_redraw_all = 0;
+        invalidate(); bar_valid = 0;
     }
-    split_row = nsplit;
-    if (nes_redraw_all || bgsel != drawn_bgsel || up0 != drawn_up0 || up1 != drawn_up1 || lo0 != drawn_lo0
-        || lo1 != drawn_lo1 || nsplit != drawn_split) {
-        drawn_bgsel = bgsel; drawn_up0 = up0; drawn_up1 = up1; drawn_lo0 = lo0; drawn_lo1 = lo1; drawn_split = nsplit;
-        nes_redraw_all = 0;
-        invalidate();
+    if (split) {
+        UWORD bp = (UWORD)((ax_reg & 0x10) ? 0x400 : 0);
+        if (bp != bar_page) { bar_page = bp; bar_valid = 0; }
     }
+
+    /* CHR RAM tiles the game rewrote */
+    for (i = 0; i < chr_ndirty; i++) {
+        UWORD tl = chr_dirty[i];
+        chr_dirty_flag[tl] = 0;
+        if ((tl >> 8) == bgsel) {
+            bar_dirty = 1;
+            if (col_lo <= col_hi) redraw_tile((UBYTE)tl);
+        }
+        if ((tl >> 8) == ((ppu_ctrl >> 3) & 1)) spr_chr_dirty = 1;
+    }
+    chr_ndirty = 0;
 
     VP(1, sync_rows(sy));
 
     /* nametable cells the game wrote (a whole new screen: draw it again column by column) */
-    if (nes_ndirty > 200) invalidate();
-    else if (col_lo <= col_hi)
-        VP(0, for (i = 0; i < nes_ndirty; i++) budget -= redraw_cell(nes_dirty[i]));
-    for (i = 0; i < nes_ndirty; i++) nes_dirty_flag[nes_dirty[i]] = 0;
+    if (nes_ndirty > 200) { invalidate(); bar_valid = 0; }
+    for (i = 0; i < nes_ndirty; i++) {
+        UWORD c = nes_dirty[i];
+        nes_dirty_flag[c] = 0;
+        if (nes_ndirty > 200) continue;
+        if ((c & 0x400) == pf_page && col_lo <= col_hi) VP(0, redraw_cell(c));
+        if (split && (c & 0x400) == bar_page && ((c & 0x3ff) < 0x100 || (c & 0x3ff) >= 0x3c0)) bar_dirty = 1;
+    }
     nes_ndirty = 0;
-    /* while the visible part is incomplete (a new screen), show black and draw quickly, as the NES's own
-       screen changes do; otherwise a few tiles a frame keep ahead of the scrolling */
+    if (bar_dirty) bar_valid = 0;
+
+    /* while the visible part is incomplete (a new screen), show black and draw quickly */
     want_cols(&vlo, &vhi);
-    budget = (on && col_lo <= vlo && col_hi >= vhi) ? 24 : 110;
+    budget = (on && col_lo <= vlo && col_hi >= vhi) ? 24 : 120;
     VP(1, stream_cols(budget));
     if (!(col_lo <= vlo && col_hi >= vhi)) on = 0;
     if (col_lo <= col_hi) fix_edges();
+    if (split && on) bar_frame(sy, !bar_valid);
+    else bar_x = -1;
 
-    if (nes_pal_dirty || on != was_on) { set_palette(on); nes_pal_dirty = 0; was_on = (UBYTE)on; }
+    if (nes_pal_dirty || on != was_on || pal0 != last_pal0) { set_palette(on, pal0); nes_pal_dirty = 0; was_on = (UBYTE)on; last_pal0 = pal0; }
     disp_scroll(cam_ux - VIEW_X, sy);
-    if ((ppu_mask & 0x10) && on) {
-        /* the sprite lists only change when the sprites or their tile set do */
-        static UBYTE last_oam[256], last_state[8];
-        UBYTE st[8];
-        st[0] = ppu_ctrl; st[1] = mmc_chr0; st[2] = mmc_chr1; st[3] = split_on; st[4] = split_chr0; st[5] = split_chr1; st[6] = split_line; st[7] = mmc_ctrl;
-        if (!spr_valid || memcmp(last_oam, nes_oam, 256) || memcmp(last_state, st, 8)) {
+    if ((mask & 0x10) && on) {
+        static UBYTE last_oam[256], last_state[4];
+        UBYTE st[4];
+        st[0] = ppu_ctrl; st[1] = (UBYTE)split; st[2] = (UBYTE)pf_h; st[3] = 0;
+        if (spr_chr_dirty) { ncache[0] = ncache[1] = 0; }
+        if (!spr_valid || spr_chr_dirty || memcmp(last_oam, nes_oam, 256) || memcmp(last_state, st, 4)) {
             VP(2, build_sprites());
-            memcpy(last_oam, nes_oam, 256); memcpy(last_state, st, 8); spr_valid = 1;
+            memcpy(last_oam, nes_oam, 256); memcpy(last_state, st, 4); spr_valid = 1;
         }
     }
     else { for (i = 0; i < 7; i++) disp_sprite_off((UWORD)i); spr_valid = 0; }
 }
-

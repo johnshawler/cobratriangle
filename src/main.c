@@ -17,7 +17,7 @@
 #include "sound.h"
 
 #undef TICKS_PER_SECOND
-#define TICKS_PER_SECOND 60             /* the NES runs at 60 frames a second: 6 ticks every 5 frames */
+#define TICKS_PER_SECOND 50             /* a PAL NES game: one NES frame per Amiga frame */
 
 /* ---- the game ------------------------------------------------------------------------------ */
 /* The game logic is the NES program translated to C (src/logic.c, src/gen_*.c): game_tick, game_bench_input

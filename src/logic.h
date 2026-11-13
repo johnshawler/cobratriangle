@@ -17,6 +17,7 @@ void game_init(void);                           /* before the first tick: ROM po
 void game_tick(unsigned short input);           /* one NES frame (1/60 s) of game logic */
 unsigned short game_bench_input(unsigned int tick);
 uint32_t game_checksum(void);
+uint32_t game_trace_sum(void);                  /* cheaper, for per-tick traces (debug builds) */
 
 extern uint8_t logic_extra_pad;                 /* NES buttons from the keyboard, ORed into every tick */
 extern uint32_t logic_frames;                   /* NES frames (NMIs) run so far */
