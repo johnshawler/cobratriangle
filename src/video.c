@@ -51,7 +51,11 @@
 #ifdef LOGIC_TRACE
 ULONG vprof[12], vtiles;                 /* debug: colour clocks in cell redraws, streaming, sprites; tiles drawn */
 extern uint32_t logic_frames;
+#ifdef NOVP                             /* debug builds without the inner timers (their own cost is large) */
+#define VP(i, x) do { x; } while (0)
+#else
 #define VP(i, x) do { ULONG t0_ = sys_now(); x; if (logic_frames >= 2000 && logic_frames < 2500) vprof[i] += sys_now() - t0_; } while (0)
+#endif
 #else
 #define VP(i, x) do { x; } while (0)
 #endif
@@ -382,26 +386,39 @@ static void bar_frame(int sy, int moved)
    alone (3 colours: colours 16+4p+1..3 are that palette); a cluster in several palettes into an attached pair
    (0/1, 2/3, 4/5: 15 colours). Each hardware sprite is reused down the screen, a segment per cluster, with
    at least one free line between segments. */
-#define NSEG    24
-#define MAXIN   64
+#define NSEG    32                      /* (powers of two: the arrays below are indexed by shifts) */
+#define MAXIN   46                      /* sprites a cluster: the struct is then 64 bytes */
 typedef struct { WORD x0, x1, y0, y1; UBYTE n, pals; BYTE se, so; UWORD oe, oo; UBYTE ie, io; UBYTE idx[MAXIN]; } Group;
 static Group grp[64];
 static int ngrp;
-static Group *hseg[7][NSEG];            /* the clusters of each hardware sprite, top to bottom */
-static int hn[7];
+static Group *hseg[8][NSEG];            /* the clusters of each hardware sprite, top to bottom */
+static int hn[8];
 #define SPR_BYTES (16 * (240 + 2 * NSEG + 4))
-static UBYTE *spr_mem[2][7];            /* two sets of sprite lists, swapped every frame */
+static UBYTE *spr_mem[2][8];            /* two sets of sprite lists, swapped every frame */
 static int spr_set;
 int video_sprites_dropped;
 ULONG vstat[4];                         /* host statistics: groups, cache hits, NES sprites drawn, merges */
 static int spr_split;                   /* under a split, sprite 0 only marks it and the bar shows from BAR_SHOW */
 
+#ifdef __m68k__
+int group_scan(Group *grp __asm("a0"), const UBYTE *oam __asm("a1"), ULONG first __asm("d0"), ULONG split __asm("d1"),
+               ULONG pfh __asm("d2"), ULONG bar_show __asm("d3"));    /* src/video68k.s: the C below, by hand */
+#endif
 static void build_groups(void)
 {
     int i, j, k;
     WORD gx0 = 0, gx1 = 0, gy0 = 0, gy1 = 0;    /* the newest group, in registers while sprites join it */
     UBYTE gn = 0, gp = 0, *gidx = 0;
     const UBYTE *oam = nes_oam + (spr_split ? 4 : 0);
+#ifdef __m68k__
+    (void)gx0; (void)gx1; (void)gy0; (void)gy1; (void)gn; (void)gp; (void)gidx; (void)oam;
+    ngrp = group_scan(grp, nes_oam, spr_split ? 1 : 0, (ULONG)spr_split, (ULONG)pf_h, BAR_SHOW);
+#ifdef GROUP_CHECK                      /* debug: the C version too, and count the frames where they differ */
+    {   static Group save[64]; int na = ngrp, m;
+        for (m = 0; m < na; m++) save[m] = grp[m];
+#endif
+#endif
+#if !defined(__m68k__) || defined(GROUP_CHECK)
     ngrp = 0;
     for (i = spr_split ? 1 : 0; i < 64; i++, oam += 4) {
         WORD y = oam[0], x = oam[3], sy = (WORD)(y + 1);
@@ -437,6 +454,14 @@ static void build_groups(void)
         gp = (UBYTE)(1 << (oam[2] & 3));
     }
     if (gn) { Group *g = &grp[ngrp - 1]; g->x0 = gx0; g->x1 = gx1; g->y0 = gy0; g->y1 = gy1; g->n = gn; g->pals = gp; }
+#endif
+#if defined(__m68k__) && defined(GROUP_CHECK)
+        if (ngrp != na) vprof[11]++;
+        else for (m = 0; m < na; m++)
+            if (save[m].x0 != grp[m].x0 || save[m].x1 != grp[m].x1 || save[m].y0 != grp[m].y0 || save[m].y1 != grp[m].y1
+                || save[m].n != grp[m].n || save[m].pals != grp[m].pals || memcmp(save[m].idx, grp[m].idx, save[m].n)) { vprof[11]++; break; }
+    }
+#endif
     for (i = 0; i < ngrp; i++)                          /* merge groups that touch and share a palette, while they fit */
         for (j = i + 1; j < ngrp && j <= i + 6; j++) {
             Group *a = &grp[i], *b = &grp[j];
@@ -528,8 +553,8 @@ typedef struct { ULONG sig, last; UWORD n; UBYTE *e, *o; } PEnt;
 static PEnt *pc;
 static int pcn;                         /* entries: a power of two */
 static ULONG vframe;
-static ULONG slot_key[2][7][NSEG];      /* what each segment slot of each sprite list holds (0: unknown) */
-static UWORD slot_off[2][7][NSEG];
+static ULONG slot_key[2][8][NSEG];      /* what each segment slot of each sprite list holds (0: unknown) */
+static UWORD slot_off[2][8][NSEG];
 static ULONG thash[512];                /* content hash of every CHR tile */
 static UBYTE scr_e[16 * 256], scr_o[16 * 256];    /* clusters that are not kept are put together here */
 
