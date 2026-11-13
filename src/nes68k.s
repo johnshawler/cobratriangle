@@ -12,6 +12,7 @@
 ;       _cpu_x,_cpu_y,_cpu_s,_cpu_c,_cpu_z,_cpu_n,_cpu_v,_cpu_i,_cpu_d
         xref    _nes_ram,_nes_prg_lo,_nes_prg_hi,_nes_prg_data,_ppu_v,_ppu_ctrl,_nes_vram,_nes_dirty,_nes_dirty_flag,_nes_ndirty,_nes_redraw_all,_nes_bank,_mmc_shift,_mmc_chr0,_mmc_chr1,_mmc_ctrl,_mmc_prg,_pad_shift,_pad_strobe,_nes_pad
         xref    _nes_io_read,_nes_read_s0,_nes_write_slow,_nes_wait,_nes_fatal,_nes_mmc_prg,_nes_mmc_ctrl
+        xref    _apu_reg,_apu_trig
         xref    _ppu_w,_ppu_oamaddr,_ppu_rdbuf,_ppu_t,_ppu_fx,_ppu_mask,_nes_oam
         xref    _nes_idle,_nes_mapper,_ax_reg,_nt_map,_nes_chr_ram,_chr_dirty_flag,_chr_dirty,_chr_ndirty,_nes_prg_hi
 
@@ -480,7 +481,31 @@ _io_wr: cmpa.w  #$2007,a0               ; PPU data port: nametable and CHR RAM w
 .m1     move.b  d3,_mmc_shift
         bra     .done
 .pad    cmpa.w  #$4016,a0               ; controller strobe
-        bne     .call
+        beq.s   .pad1
+        cmpa.w  #$4018,a0               ; APU registers (not the OAM DMA): as nes_write_slow() does them
+        bcc     .call
+        cmpa.w  #$4000,a0
+        bcs     .call
+        cmpa.w  #$4014,a0
+        beq     .call
+        move.w  a0,d3
+        sub.w   #$4000,d3
+        lea     _apu_reg,a1
+        move.b  d4,(a1,d3.w)
+        cmp.w   #$15,d3
+        bne.s   .apu1
+        or.b    #$10,_apu_trig
+        bra     .done
+.apu1   cmp.w   #$10,d3
+        bcc     .done
+        move.w  d3,d0
+        and.w   #3,d0
+        cmp.w   #3,d0
+        bne     .done
+        lsr.w   #2,d3
+        bset    d3,_apu_trig
+        bra     .done
+.pad1
         move.b  d4,d3
         and.b   #1,d3
         move.b  d3,_pad_strobe

@@ -15,6 +15,7 @@
 #include "logic.h"
 #include "video.h"
 #include "sound.h"
+void tile8(UBYTE *d __asm("a0"), const UBYTE *chr __asm("a1"), ULONG attr __asm("d0"));   /* src/video68k.s */
 
 #undef TICKS_PER_SECOND
 #define TICKS_PER_SECOND 50             /* a PAL NES game: one NES frame per Amiga frame */
@@ -158,7 +159,8 @@ int main(int argc, char **argv)
                             (unsigned long)nes_prg_data, (unsigned long)reset_fn, (unsigned long)&b); }
                 fh = Open((CONST_STRPTR)"video.txt", MODE_NEWFILE); if (fh) { Write(fh, b, strlen(b)); Close(fh); } }
             {   extern void *reset_fn; extern ULONG prof_buf[], prof_cnt; ULONG base = (ULONG)reset_fn; fh = Open((CONST_STRPTR)"prof.bin", MODE_NEWFILE);
-                ULONG cbase = (ULONG)game_tick; if (fh) { Write(fh, &base, 4); Write(fh, &cbase, 4); Write(fh, prof_buf, prof_cnt * 4); Close(fh); } }
+                ULONG cbase = (ULONG)game_tick, vbase = (ULONG)tile8, magic = 0x50524f33;   /* "PRO3": three bases */
+                if (fh) { Write(fh, &magic, 4); Write(fh, &base, 4); Write(fh, &cbase, 4); Write(fh, &vbase, 4); Write(fh, prof_buf, prof_cnt * 4); Close(fh); } }
             {   fh = Open((CONST_STRPTR)"frames.bin", MODE_NEWFILE); if (fh) { Write(fh, frame_log, frame_n * 8); Close(fh); } }
             {   fh = Open((CONST_STRPTR)"framevt.bin", MODE_NEWFILE); if (fh) { Write(fh, frame_vt, frame_n * 4); Close(fh); } }
             {   extern uint32_t logic_time[]; fh = Open((CONST_STRPTR)"ticktime.bin", MODE_NEWFILE);
