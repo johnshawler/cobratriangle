@@ -17,7 +17,7 @@ Stock A1200 bench:     frames=999 late=2523 worst_cck=2638762 avg_cck=207114 bud
 With 4 MB fast RAM:    frames=1402 late=1649 worst_cck=1672779 avg_cck=105228 budget_cck=71051 worst_pct=2354 avg_pct=148 display_hz=50 shown_fps=22.9
                        ticks=3000 checksum=21a7571d
 With 8 MB fast RAM:    the same line (4 and 8 MB give identical results)
-Kickstart 3.1 (40.68):  frames=998 late=2605 worst_cck=2636297 avg_cck=212858 budget_cck=71051 worst_pct=3710 avg_pct=299 display_hz=50 shown_fps=13.8
+Kickstart 3.1 (40.68):  (previous build, before the display work) frames=998 late=2605 worst_cck=2636297 avg_cck=212858 budget_cck=71051 worst_pct=3710 avg_pct=299 display_hz=50 shown_fps=13.8
                        ticks=3000 checksum=21a7571d  (the user's Commodore ROM via --kickstart_file, stock A1200;
                        takeover and return to the AmigaDOS shell checked on a screenshot)
 Host checksum:         21a7571d after 3000 ticks  equal (stock and fast RAM)
