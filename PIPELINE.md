@@ -40,6 +40,17 @@ Rules that come with it:
 - If milestone 3 says the stock machine cannot hold 50 Hz, say so in the report early and target the cheapest
   upgrade explicitly. Don't spend days on the stock machine.
 
-## Part B: backlog for this port
+## Part B: backlog for this port (Cobra Triangle)
 
-(Fill in after the load measurement and the first profile. The last port's backlog is in history/llb/PIPELINE.md.)
+Status: checksum equal on stock and fast RAM over the 3,000-tick bench; 13.8 fps stock, 21.9 fps with 4 MB
+fast RAM; logic ~53k colour clocks a tick on fast RAM, display ~80k a frame. Details in LEARNINGS.md section 3.
+
+| Priority | Item | Expected gain | Effort | How to know it worked |
+| --- | --- | --- | --- | --- |
+| 1 | Sprite clustering and segment rendering in assembly; keep clusters across frames | -20k a frame | medium | `video.txt` sprites/grouping |
+| 2 | Straddling row under the status bar: redraw only its visible lines | -5k a frame when scrolling | small | `video.txt` stream |
+| 3 | Next hand-written routines from a play-only profile (`_rd_ea` callers, the tile decompressor at bank 1 $8430) | -5-10k a tick | medium each | checksum equal; `ticktime.bin` |
+| 4 | Colour 0 black, playfield backdrop on another index (border colour) | quality | small | screenshot |
+| 5 | Measure a 68030 + fast RAM | the honest upgrade number | small | a third bench line in REPORT.txt |
+| 6 | Listen to the sound; DMC samples | quality | medium | by ear |
+| 7 | Stock A1200 at 50 Hz | not reachable by translation (7,450+ 6502 instructions a frame) | - | - |

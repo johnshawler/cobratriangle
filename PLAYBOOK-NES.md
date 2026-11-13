@@ -135,3 +135,18 @@ sections above if a lesson is general.
 - Biggest wins were I/O plumbing found by the profiler (OAM DMA, controller, MMC1, PPU writes), not game logic.
 - Next time: measure the load on day one (it decided the outcome); build the 1 kHz profiler before optimising
   anything; don't trust static cost estimates; write the display on the host harness first.
+
+### 2. Cobra Triangle (Rare 1989, PAL), AxROM (mapper 7) + CHR RAM, 2026-11
+
+- Load: 7,450 average, 8,700 max 6502 instructions per frame in play (no demo mode: scripted play from START);
+  title screens 500-1,900. PAL, so one tick per Amiga frame.
+- Result: checksum equal on both machines over 3,000 ticks; 13.8 fps stock, 21.9 fps with 4 MB fast RAM.
+  Fast RAM: logic ~53k colour clocks a tick, display ~80k a frame (51 NES sprites on screen).
+- New: AxROM bank model in the translator, NMI-driven idle-loop frame model, CHR RAM, PAL reference timing, a
+  status bar split shown by blitting the bar under the view, 7-channel sprite allocation, `tools/prof.py`.
+- Found in the shared runtime: STY to an I/O address fell into `_set_prg` (now fixed): test every helper entry.
+- The day-one verdict held again (stock: no; fast RAM: borderline). The display, not the logic, was the
+  surprise: with 50 NES sprites a frame and CHR RAM animation, sprites cost more than half the display.
+- Next time: estimate the display from the sprite count on day one (visible OAM entries per frame from the
+  reference), not only the CPU load; build the I/O fast paths for every PPU register before the first bench;
+  run short emulator benches (bench.sh's time limit makes a slow port look crashed).

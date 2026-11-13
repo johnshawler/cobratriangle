@@ -1,0 +1,31 @@
+PORT REPORT
+Game:                  Cobra Triangle (Rare 1989), NES, European PAL release (mapper 7 AxROM, 128 KB PRG, CHR RAM)
+Class and route:       Assembly/binary for a 6502 machine: translated once on the host (tools/recomp.py) to 68k
+                       assembly (tools/back68k.py); NES video, sound and input replaced by src/video.c, src/sound.c,
+                       src/nes.c and the kit
+Display:               planes=4 scroll=1 fetch=0 buffers=1 sprites used=7 (0-6: 3 attached pairs or 6 singles + 6)
+                       colours=16 playfield/status bar + 16 sprite (NES palettes)
+Busiest moment:        play: 51 NES sprites on average, diagonal scrolling, status bar redrawn under the view.
+                       Not a budget sum: the logic alone is ~96k colour clocks a tick on the stock machine
+                       (135% of a frame) and ~53k on 4 MB fast RAM (74%); the display ~80-130k a frame
+Cut from the original: cycle-timed raster effects (their result is shown: the status bar; their timing is not),
+                       lag frames (the translated logic always finishes its frame; the NES lags about once in 750
+                       play frames), DMC samples, sprite-behind-background priority, colour emphasis bits
+Stock A1200 bench:     frames=996 late=2606 worst_cck=2636781 avg_cck=213348 budget_cck=71051 worst_pct=3711 avg_pct=300 display_hz=50 shown_fps=13.8
+                       ticks=3000 checksum=21a7571d  (FS-UAE 3.1.66, A1200 model, AROS ROM)
+With 4 MB fast RAM:    frames=1342 late=1713 worst_cck=1671625 avg_cck=111312 budget_cck=71051 worst_pct=2352 avg_pct=156 display_hz=50 shown_fps=21.9
+                       ticks=3000 checksum=21a7571d
+Host checksum:         21a7571d after 3000 ticks  equal (stock and fast RAM)
+Frame rate claim:      13.8 fps shown on the stock A1200, 21.9 fps with 4 MB fast RAM, logic at 50 ticks (game
+                       time exact). 50 Hz NOT held: tools/port.sh prints FAIL (late, worst_pct). The stock machine
+                       cannot hold 50 Hz by translation (load measured on day one: 7,450-8,700 6502 instructions a
+                       frame); the cheapest upgrade that might, with more hand-written routines, is fast RAM; a
+                       68030 accelerator is the safe one (not measured).
+Not done, not tested:  real hardware; the Commodore Kickstart 3.1 ROM the user supplied (every bench ran under
+                       the AROS ROM, as tools/bench.sh does); NTSC; sound not listened to (the APU-on-Paula code of
+                       the previous port is built in, unchanged); DMC samples; a 68030 bench; play-testing by a person
+                       beyond the scripted bench; the overscan border shows the playfield backdrop colour.
+How to run:            tools/make_assets.sh (needs original/cobra.nes), then tools/port.sh builds dist/cobra.
+                       On the Amiga: "cobra" (Escape quits), "cobra bench 3000" writes bench.txt.
+                       Keys: joystick or cursor keys steer, fire = A (also X key), Z/Alt = B (turbo),
+                       Return = Start (pause; starts the game on the title), Space = Select.
