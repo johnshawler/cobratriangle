@@ -1,0 +1,2047 @@
+From a0317a11b3d43e9eca1caa4dec134f3b0ce2e932 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 13 Nov 2026 12:30:04 +0000
+Subject: [PATCH] Bring back the Cobra Triangle port's tools and lessons:
+ AxROM, CHR RAM, NMI-driven games, PAL, faster I/O
+
+- recomp.py/back68k.py: AxROM (mapper 7) bank model: a bank write ends the function, the rest is dispatched in
+  the new bank; bank check after JSRs to functions that may switch; IDLE waits (jump/branch to itself);
+  LDA #$40/BIT $2002/BEQ recognised as a sprite-0 wait
+- nesref: AxROM, PAL timing, B (bank change) flow lines, TRACE_FROM, NMI_LOG
+- nes.c/nes.h: nt_map mirroring table, AxROM register, CHR RAM with dirty tiles, split_ax/mask/pal0
+- logic.c/verify.c: nes_idle() (longjmp back to nes_main, NMI vector of the mapped bank); trace checksum
+- nes68k.s: FIX: STY to I/O fell into _set_prg; fast paths for all PPU registers, $2007/$4017 reads,
+  CHR RAM writes and the AxROM register
+- video68k.s: tile8 masks the attribute planes by the pixels (colour 0 stays 0)
+- tools: prof.py (names 1 kHz profiler samples), cmp_trace.py (first differing tick), debug_run.sh/shot_at.sh
+  use NAME from port.conf, vhost.c handles unattached sprites, make_assets.sh accepts AxROM + CHR RAM
+- PLAYBOOK-NES.md: new sections and lessons-log entry 2; history/cobra: the port's report, learnings, notes
+
+Not re-run against Little League Baseball here (no ROM in this session).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01VAWMaBP4BJTmyD7VnDCuPj
+---
+ PLAYBOOK-NES.md                  |  40 ++++++-
+ history/cobra/LEARNINGS.md       |  70 ++++++++++++
+ history/cobra/NOTES.md           |  12 ++
+ history/cobra/PIPELINE.md        |  56 ++++++++++
+ history/cobra/REPORT.txt         |  33 ++++++
+ history/cobra/original-README.md |  37 +++++++
+ src/host_test.c                  |  16 ++-
+ src/logic.c                      |  66 ++++++++++-
+ src/logic.h                      |   1 +
+ src/nes.c                        |  65 ++++++++---
+ src/nes.h                        |  17 ++-
+ src/nes68k.s                     | 185 +++++++++++++++++++++++++++++--
+ src/run68k.c                     |   2 +-
+ src/run_c.c                      |   2 +-
+ src/video68k.s                   |  21 ++--
+ tools/back68k.py                 |  26 ++++-
+ tools/cmp_trace.py               |  10 ++
+ tools/debug_run.sh               |   8 +-
+ tools/games/cobra.py             |  76 +++++++++++++
+ tools/make_assets.sh             |   7 +-
+ tools/nesref/nesref.c            |  54 ++++++---
+ tools/nesref/verify.c            |  27 +++--
+ tools/prof.py                    |  52 +++++++++
+ tools/recomp.py                  | 136 +++++++++++++++++++----
+ tools/shot_at.sh                 |   6 +-
+ tools/vhost.c                    |  34 ++++--
+ 26 files changed, 944 insertions(+), 115 deletions(-)
+ create mode 100644 history/cobra/LEARNINGS.md
+ create mode 100644 history/cobra/NOTES.md
+ create mode 100644 history/cobra/PIPELINE.md
+ create mode 100644 history/cobra/REPORT.txt
+ create mode 100644 history/cobra/original-README.md
+ create mode 100644 tools/cmp_trace.py
+ create mode 100644 tools/games/cobra.py
+ create mode 100644 tools/prof.py
+
+diff --git a/PLAYBOOK-NES.md b/PLAYBOOK-NES.md
+index 416e112..27affd7 100644
+--- a/PLAYBOOK-NES.md
++++ b/PLAYBOOK-NES.md
+@@ -16,7 +16,8 @@ resets the per-game files and keeps everything reusable. The Claude skill in `sk
+ | --- | --- | --- |
+ | Generic 6502 | `tools/op6502.py`, `tools/dis.py`, `tools/recomp.py`, `tools/back68k.py`, `tools/nesref/verify.c`, `src/coro*.{s,c,h}`, `src/run*.{c,h}`, `src/nes68k.s` (helpers), `src/logic.c` frame model | use as is |
+ | NES machine | `tools/nesref/nesref.c` (reference NES), `src/nes.{c,h}` (PPU/APU/pad state), `src/video.{c,h}` + `src/video68k.s` (PPU → AGA), `src/sound.{c,h}` (APU → Paula), `tools/vhost.c`, `tools/shost.c` | use; extend for what the game uses |
+-| Mapper | MMC1 in `nesref.c`, `nes.c`, and the fast paths in `nes68k.s` (`_set_prg`, `_io_wr`) | add the new mapper in all three |
++| Mapper | MMC1 and AxROM (mapper 7) in `nesref.c`, `nes.c`, `recomp.py`/`back68k.py` (bank model) and the fast paths in `nes68k.s` (`_set_prg`, `_io_wr` `.ax`) | add the new mapper in all of them |
++| CHR RAM | `nes.c` keeps `nes_chr_ram` and a dirty-tile list; `nes68k.s` writes it in the `$2007` fast path; `video.c` redraws cells/sprites using a changed tile | use as is |
+ | Per game | `tools/games/<game>.py` (NORETURN, hand-written routines), `game_bench_input` in `src/logic.c`, the flow traces in `tools/flow/`, `tools/make_assets.sh` (ROM check), `original/README.md` | write new |
+ | Starting a port | `tools/new_port.sh`, `skills/amiga-nes-port/SKILL.md` | run once / install once |
+ | Debugging | `tools/debug_run.sh`, `tools/shot_at.sh`, `src/prof68k.s` (1 kHz profiler), `LOGIC_TRACE`/`LOGIC_NOSUM`/`LOGIC_DUMP`/`HOLD_AT` builds | use as is |
+@@ -43,6 +44,17 @@ resets the per-game files and keeps everything reusable. The Claude skill in `sk
+   changes after it belongs to the lower part of the picture.
+ - **Stack tricks** (jump tables after JSR, `PLA PLA RTS`, pushed-address RTS): the 6502 stack stays in RAM,
+   RTS compares with the caller's expectation and unwinds. Jump-table dispatchers go in `NORETURN`.
++- **NMI-driven games** (main thread `JMP *` or `BNE *`, the NMI does the frame and resets the stack with `TXS`):
++  recomp.py marks a jump/branch to itself as an `IDLE` wait; `nes_idle()` in `logic.c` longjmps back to
++  `nes_main`, which pushes the idle address and runs the NMI vector of the mapped bank. `verify.c` does the same.
++- **Mid-frame split without a sprite-0 BVC**: `LDA #$40; BIT $2002; BEQ` is also a sprite-0 wait (recomp.py looks
++  at the `LDA #` before the loop). Cycle-timed delay loops after it (`DEX/BNE`) are replaced by hand (HLE) with
++  their end state; record what the split changes (scroll, page, PPUMASK, backdrop: `split_*` in `nes.c`).
++- **AxROM bank switches** swap all of $8000-$FFFF under the running code: the translated function ends at the
++  store and dispatches the next address in the new bank; continuations come from `LDA #n` before the store,
++  from code identical in all banks, and from the traces (`B` lines of `nesref -c`). After a JSR to a function
++  that may switch, the caller checks its bank (`cmpa.l #bank,a3`) and dispatches if it changed.
++- **PAL games** (NES 2.0 header byte 12): `nesref` runs 312-line frames; `TICKS_PER_SECOND` 50 in `main.c`.
+ - **Lag**: check with the reference whether the original finishes its logic within each frame in the busy
+   scenes. If it doesn't, game time on the NES is slower there and the frame model would need cycle budgets
+   (not needed for Little League Baseball).
+@@ -94,15 +106,20 @@ Say the verdict in the report from the start; name the upgrade.
+ - Background: 4 planes = 16 NES colours (attribute bits as planes 2–3), hardware scroll over an unwrapped world,
+   stream tile columns, each tile row at y and y+240 drawing only the shown copy, border columns blank, honour
+   PPUMASK's hidden left column. Tile-set-only splits: draw rows with the right tile set.
+-- Sprites: cluster ≤ 64 px, 64-pixel attached pairs (15 colours), reuse channels down the screen, cache unchanged
+-  clusters from the previous sprite set. Sprite-behind-background priority is not done yet.
++- Sprites: cluster ≤ 64 px; a cluster in one NES palette p goes alone into sprite 2p or 2p+1 (the Amiga sprite
++  colour groups are the NES sprite palettes), mixed clusters into 64-pixel attached pairs (15 colours); reuse
++  every sprite down the screen, cache unchanged clusters from the previous sprite set. Seven channels instead of
++  four cut dropped clusters from 1,233 to 214 in Cobra Triangle. Sprite-behind-background priority is not done yet.
++- Backdrop colours that differ above and below a split: draw tiles with the attribute planes masked by the
++  pixels (colour 0 stays 0), then colours 4/8/12 are free for the other part's backdrop.
+ - Sound: APU model (length, envelope, sweep, linear counter, 240 Hz sequencer) → Paula periods and volumes with
+   looped one-period waveforms. DMC not done yet.
+ - Develop both on the host harnesses (`tools/vhost.c`, `tools/shost.c`), then confirm on the emulator.
+ 
+ ## 8. Not done yet (do it when a game needs it)
+ 
+-Other mappers (UxROM, CNROM, MMC3 with its scanline IRQ); scroll changes at a split; sprite-behind-background;
++Other mappers (UxROM, CNROM, MMC3 with its scanline IRQ); scroll changes at a split in general (Cobra
++Triangle's bottom status bar is blitted under the view: `video.c` `bar_frame`); sprite-behind-background;
+ DMC samples; 8×16 sprites in `video.c` (the reference handles them); lag (cycle budgets); a 68030 bench.
+ 
+ ## 9. Lessons log (append one entry per port, newest last)
+@@ -118,3 +135,18 @@ sections above if a lesson is general.
+ - Biggest wins were I/O plumbing found by the profiler (OAM DMA, controller, MMC1, PPU writes), not game logic.
+ - Next time: measure the load on day one (it decided the outcome); build the 1 kHz profiler before optimising
+   anything; don't trust static cost estimates; write the display on the host harness first.
++
++### 2. Cobra Triangle (Rare 1989, PAL), AxROM (mapper 7) + CHR RAM, 2026-11
++
++- Load: 7,450 average, 8,700 max 6502 instructions per frame in play (no demo mode: scripted play from START);
++  title screens 500-1,900. PAL, so one tick per Amiga frame.
++- Result: checksum equal on both machines over 3,000 ticks; 13.8 fps stock, 21.9 fps with 4 MB fast RAM.
++  Fast RAM: logic ~53k colour clocks a tick, display ~80k a frame (51 NES sprites on screen).
++- New: AxROM bank model in the translator, NMI-driven idle-loop frame model, CHR RAM, PAL reference timing, a
++  status bar split shown by blitting the bar under the view, 7-channel sprite allocation, `tools/prof.py`.
++- Found in the shared runtime: STY to an I/O address fell into `_set_prg` (now fixed): test every helper entry.
++- The day-one verdict held again (stock: no; fast RAM: borderline). The display, not the logic, was the
++  surprise: with 50 NES sprites a frame and CHR RAM animation, sprites cost more than half the display.
++- Next time: estimate the display from the sprite count on day one (visible OAM entries per frame from the
++  reference), not only the CPU load; build the I/O fast paths for every PPU register before the first bench;
++  run short emulator benches (bench.sh's time limit makes a slow port look crashed).
+diff --git a/history/cobra/LEARNINGS.md b/history/cobra/LEARNINGS.md
+new file mode 100644
+index 0000000..88dbcbd
+--- /dev/null
++++ b/history/cobra/LEARNINGS.md
+@@ -0,0 +1,70 @@
++# Learnings from porting Cobra Triangle (NES, PAL, AxROM) to the A1200
++
++The second NES port with this template (the first, Little League Baseball, is in history/llb/). General lessons
++are folded into PLAYBOOK-NES.md; numbers are in REPORT.txt; brief problems in NOTES.md.
++
++## 1. What was new against the first port, and how it was done
++
++- **AxROM (mapper 7)**: four 32 KB banks switched as a whole, no fixed bank, every bank has its own vectors.
++  The translator's bank model got a second mode (`AX` in tools/recomp.py): a store to $8000-$FFFF ends the
++  translated function and the next address is dispatched in the bank then mapped. Continuation entries come
++  from `LDA #n` before the store, from code that is identical in all banks (the $FF80 trampoline), and from
++  new `B` lines in `nesref -c` traces (the first instruction run in a new bank). After a JSR to a function that
++  may switch banks the caller checks `a3` and dispatches if its bank is gone. On the Amiga the bank register
++  is a fast path (`.ax` in src/nes68k.s): a3/a4/nes_bank and the one-screen page, no C call.
++- **NMI-driven frame model**: the main thread is `JMP *`; the NMI does the whole frame and resets the stack.
++  A jump or branch to itself is an `IDLE` wait: `nes_idle()` longjmps back to `nes_main()`, which pushes the
++  idle address and P and runs the NMI vector *of the mapped bank* (they differ per bank). verify.c does the same.
++  The 6502 stack stays exact (the checksum covers it).
++- **CHR RAM**: `nes_chr_ram` plus a dirty-tile list, written by the `$2007` fast path; the display redraws only
++  cells and sprite clusters using a rewritten tile (a "tile seen on screen" table avoids scanning the
++  nametable for tiles that are not shown; a burst of more than 12 tiles is a new tile set: redraw all).
++- **PAL**: `nesref` got 312-line timing; one NES frame = one Amiga frame (TICKS_PER_SECOND 50).
++- **A split that changes scroll and page**: the status bar. Kept as a bitmap (rebuilt when its cells or tiles
++  change) and blitted into the scrolling buffer under the 180-line playfield view whenever the view moves; the
++  row copies it covers are marked stale and redrawn when they scroll into view. Its backdrop (black) differs
++  from the playfield's, so tiles are drawn with the attribute planes masked by the pixels: colour 0 stays 0
++  and colour 4 is free for the bar's backdrop.
++- **Sprites**: seven channels instead of four: a cluster in one NES palette p goes alone into sprite 2p or
++  2p+1 (the Amiga sprite colour groups are the NES palettes), mixed clusters into attached pairs. Dropped
++  clusters over the bench: 1,233 -> 214.
++
++## 2. Bugs worth remembering
++
++- `_io_wr_d2` (STY to I/O) fell through into `_set_prg` in the shared runtime: the first game never stored Y to
++  an I/O address, so its checksums were equal. Cobra's `STY $8000` hung the Amiga after the title. Found by
++  bisecting the tick where the Amiga stopped finishing and reading the helpers the new code paths used.
++  Lesson: shared helpers need a test of every entry, not only what one game exercised.
++- `LDA #$40; BIT $2002; BEQ *-3` is a sprite-0 wait; the wait detector took it for a vblank wait.
++- Two emulator runs building the same program name at once corrupt each other (debug_run.sh/shot_at.sh now use
++  NAME from port.conf; still run them one at a time).
++- `tools/bench.sh` gives a run frames/25 + 60 seconds: a port slower than ~20 fps over 3,000 ticks shows
++  "NO bench.txt" although it is only slow. Try a shorter run before suspecting a crash.
++
++## 3. Numbers (bench ticks 1500-3000, play)
++
++| Measure | Stock | 4 MB fast RAM |
++| --- | --- | --- |
++| 6502 instructions per frame (reference) | 7,450 avg, 8,700 max | same |
++| Logic per tick, first build | 96k colour clocks | 58k |
++| Logic per tick, after I/O fast paths and the CHR upload by hand | not measured separately | 53k |
++| Display per frame, first build | 133k | 98k (sprites 41k, grouping 15k) |
++| Display per frame, after the display fixes | not measured | 80k |
++| Shown fps (tools/port.sh) | 11.5 -> 13.8 | 17.4 -> 21.9 |
++
++What bought speed: PPU register and `$2007`/`$4017` read fast paths (about 100 C calls a tick gone): 17.4 ->
++19.1 fps on fast RAM; the boat's CHR upload ($FFA1/$FFA9 in bank 2, ~160 `$2007` writes a tick) by hand: 19.1 ->
++21.9; display: no nametable scan for unseen tiles, the bar re-rendered only when its own tiles change,
++sprite cache invalidated per tile instead of entirely.
++
++## 4. What to try next (fast RAM, play)
++
++1. Sprites: 51 visible NES sprites a frame; clustering and rendering in C cost ~40k. Grouping in assembly and
++   keeping clusters across frames (the scenery moves with the scroll) are the next big display item.
++2. The straddling tile row under the bar is redrawn every frame the view moves (~40 tiles): draw only the lines
++   above the bar, or move the bar blit to the tile boundary.
++3. Logic: profile again restricted to play; `(zp),y` reads through `_rd_ea` (the decompressor at bank 1 $8430
++   streams tiles through PHA into the stack page) and `_plp` are next.
++4. Colour 0 is the playfield backdrop, so the overscan border is blue; use another index for the playfield
++   backdrop and keep colour 0 black.
++5. Measure a 68030 (FS-UAE accelerator options): the honest "cheapest upgrade" number.
+diff --git a/history/cobra/NOTES.md b/history/cobra/NOTES.md
+new file mode 100644
+index 0000000..8121050
+--- /dev/null
++++ b/history/cobra/NOTES.md
+@@ -0,0 +1,12 @@
++# Notes: where the brief was unclear, wrong or missing something
++
++(Earlier ports: history/*/NOTES.md. Add one line for every new place.)
++- The brief and kit assume one display set-up for the whole picture; a NES status bar under a raster split (scroll
++  and nametable change at line 180) has no kit call. Worked around by blitting the bar into the scrolling buffer
++  under the view whenever the view moves (src/video.c); a kit split-screen call would be cheaper and exact.
++- tools/setup.sh installed m68k-amigaos-gcc 16.2.1b (AmigaDev image of 2026-10), not the 6.5.0b the brief names.
++- A PAL NES game needs TICKS_PER_SECOND 50 (src/main.c); the brief's 60 Hz advice does not apply.
++- The brief's Step 1 route for 6502 code does not mention bank switching that swaps all of $8000-$FFFF under the
++  running code (AxROM): the translator must end a function at the bank write and dispatch the rest.
++- tools/debug_run.sh and tools/shot_at.sh had the previous game's program name built in; they now use NAME from port.conf.
++- tools/bench.sh boots AROS only; the real Kickstart is reached by passing --kickstart_file=<rom> as an extra option (worked unchanged).
+diff --git a/history/cobra/PIPELINE.md b/history/cobra/PIPELINE.md
+new file mode 100644
+index 0000000..a0c5a78
+--- /dev/null
++++ b/history/cobra/PIPELINE.md
+@@ -0,0 +1,56 @@
++# Development pipeline, reprioritised
++
++What this port taught (see `LEARNINGS.md`) changes the order of work. Part A replaces the milestone order of
++BRIEF.md Step 4 for ports of translated binaries (NES/6502 and similar); the gates and the referee
++(`tools/port.sh`) are unchanged. Part B is the prioritised backlog for this port.
++
++## Why the order changes
++
++- The deciding number came last in the brief's order: how busy the original CPU is. It is measurable on day one
++  with a reference emulator, and it alone decided that 50 Hz on a stock machine was out of reach.
++- Correctness tooling paid for itself many times over: every translator bug was found in minutes by "first tick
++  that differs, then a RAM dump". Built late, every bug would have been a guess.
++- The cheapest large wins were I/O plumbing (OAM DMA, controller, mapper, PPU writes), found only with an
++  unbiased profiler. Static cost estimates pointed the wrong way several times.
++- Display bugs were found on the host harness, not in the emulator.
++
++## Part A: milestone order for a translated-binary port
++
++| # | Milestone | Gate | Was |
++| --- | --- | --- | --- |
++| 1 | Reference emulator of the original machine, headless, scripted input, frame dumps | Frames match the real game's screens | new |
++| 2 | **Load measurement**: original CPU instructions per frame by scene (exclude wait loops) | Number per scene, written into the feasibility note | new |
++| 3 | Feasibility note with the load: instructions/frame × 10–13 colour clocks (stock, chip RAM) or ×5–6 (fast RAM) + the display budget of Step 2, against 57k (80%) | Honest verdict per machine *before* code is written | 1 |
++| 4 | Kit skeleton builds and benches | `late=0` | 2 |
++| 5 | Traces → static translation to C; frame model (waits, NMI, coroutine) | Translated C equals an instruction interpreter tick by tick for ≥ 20,000 ticks | 3 |
++| 6 | Asset script (ROM split, translation) with no manual step | `tools/make_assets.sh` from the ROM alone | 4 |
++| 7 | 68k back end (registers in registers, 6502 flags in 68k flags, liveness) | Amiga checksum = host checksum for every tick of the bench | 8 (moved up) |
++| 8 | Debug tooling on the Amiga: per-tick checksum and RAM dump, per-tick time, **1 kHz CIA profiler**, per-frame (vblank, tick) log | Profile of the busiest scene names its top routines | new |
++| 9 | I/O fast paths and hand-written hot routines, chosen by the profiler, each guarded and proven by the checksum | Logic per tick in the busiest scene within its share of the budget | new |
++| 10 | Host display harness (fake kit calls → PPM) | Screens match the reference emulator's | new |
++| 11 | Background, scrolling, splits | Harness screenshots, then emulator screenshots, match | 5, 6 |
++| 12 | Sprites (hardware first, multiplexed if needed) | No dropped clusters on the harness over the bench | 7 |
++| 13 | Display cost: profile the display in the busiest scene, cut instruction count (not memory traffic) | Display + logic under 80% in the busiest scene | new |
++| 14 | Sound | Still the same `late` | 9 |
++| 15 | Final bench on stock and fast RAM | The brief's gates; report | 10 |
++
++Rules that come with it:
++- Measure before optimising, and only in the busiest scene. Re-measure after every change; keep the checksum
++  equal after every change.
++- If milestone 3 says the stock machine cannot hold 50 Hz, say so in the report early and target the cheapest
++  upgrade explicitly. Don't spend days on the stock machine.
++
++## Part B: backlog for this port (Cobra Triangle)
++
++Status: checksum equal on stock and fast RAM over the 3,000-tick bench; 13.8 fps stock, 21.9 fps with 4 MB
++fast RAM; logic ~53k colour clocks a tick on fast RAM, display ~80k a frame. Details in LEARNINGS.md section 3.
++
++| Priority | Item | Expected gain | Effort | How to know it worked |
++| --- | --- | --- | --- | --- |
++| 1 | Sprite clustering and segment rendering in assembly; keep clusters across frames | -20k a frame | medium | `video.txt` sprites/grouping |
++| 2 | Straddling row under the status bar: redraw only its visible lines | -5k a frame when scrolling | small | `video.txt` stream |
++| 3 | Next hand-written routines from a play-only profile (`_rd_ea` callers, the tile decompressor at bank 1 $8430) | -5-10k a tick | medium each | checksum equal; `ticktime.bin` |
++| 4 | Colour 0 black, playfield backdrop on another index (border colour) | quality | small | screenshot |
++| 5 | Measure a 68030 + fast RAM | the honest upgrade number | small | a third bench line in REPORT.txt |
++| 6 | Listen to the sound; DMC samples | quality | medium | by ear |
++| 7 | Stock A1200 at 50 Hz | not reachable by translation (7,450+ 6502 instructions a frame) | - | - |
+diff --git a/history/cobra/REPORT.txt b/history/cobra/REPORT.txt
+new file mode 100644
+index 0000000..1c94674
+--- /dev/null
++++ b/history/cobra/REPORT.txt
+@@ -0,0 +1,33 @@
++PORT REPORT
++Game:                  Cobra Triangle (Rare 1989), NES, European PAL release (mapper 7 AxROM, 128 KB PRG, CHR RAM)
++Class and route:       Assembly/binary for a 6502 machine: translated once on the host (tools/recomp.py) to 68k
++                       assembly (tools/back68k.py); NES video, sound and input replaced by src/video.c, src/sound.c,
++                       src/nes.c and the kit
++Display:               planes=4 scroll=1 fetch=0 buffers=1 sprites used=7 (0-6: 3 attached pairs or 6 singles + 6)
++                       colours=16 playfield/status bar + 16 sprite (NES palettes)
++Busiest moment:        play: 51 NES sprites on average, diagonal scrolling, status bar redrawn under the view.
++                       Not a budget sum: the logic alone is ~96k colour clocks a tick on the stock machine
++                       (135% of a frame) and ~53k on 4 MB fast RAM (74%); the display ~80-130k a frame
++Cut from the original: cycle-timed raster effects (their result is shown: the status bar; their timing is not),
++                       lag frames (the translated logic always finishes its frame; the NES lags about once in 750
++                       play frames), DMC samples, sprite-behind-background priority, colour emphasis bits
++Stock A1200 bench:     frames=996 late=2606 worst_cck=2636781 avg_cck=213348 budget_cck=71051 worst_pct=3711 avg_pct=300 display_hz=50 shown_fps=13.8
++                       ticks=3000 checksum=21a7571d  (FS-UAE 3.1.66, A1200 model, AROS ROM)
++With 4 MB fast RAM:    frames=1342 late=1713 worst_cck=1671625 avg_cck=111312 budget_cck=71051 worst_pct=2352 avg_pct=156 display_hz=50 shown_fps=21.9
++                       ticks=3000 checksum=21a7571d
++Kickstart 3.1 (40.68):  frames=998 late=2605 worst_cck=2636297 avg_cck=212858 budget_cck=71051 worst_pct=3710 avg_pct=299 display_hz=50 shown_fps=13.8
++                       ticks=3000 checksum=21a7571d  (the user's Commodore ROM via --kickstart_file, stock A1200;
++                       takeover and return to the AmigaDOS shell checked on a screenshot)
++Host checksum:         21a7571d after 3000 ticks  equal (stock and fast RAM)
++Frame rate claim:      13.8 fps shown on the stock A1200, 21.9 fps with 4 MB fast RAM, logic at 50 ticks (game
++                       time exact). 50 Hz NOT held: tools/port.sh prints FAIL (late, worst_pct). The stock machine
++                       cannot hold 50 Hz by translation (load measured on day one: 7,450-8,700 6502 instructions a
++                       frame); the cheapest upgrade that might, with more hand-written routines, is fast RAM; a
++                       68030 accelerator is the safe one (not measured).
++Not done, not tested:  real hardware; fast RAM under Kickstart 3.1 (only AROS); NTSC; sound not listened to (the APU-on-Paula code of
++                       the previous port is built in, unchanged); DMC samples; a 68030 bench; play-testing by a person
++                       beyond the scripted bench; the overscan border shows the playfield backdrop colour.
++How to run:            tools/make_assets.sh (needs original/cobra.nes), then tools/port.sh builds dist/cobra.
++                       On the Amiga: "cobra" (Escape quits), "cobra bench 3000" writes bench.txt.
++                       Keys: joystick or cursor keys steer, fire = A (also X key), Z/Alt = B (turbo),
++                       Return = Start (pause; starts the game on the title), Space = Select.
+diff --git a/history/cobra/original-README.md b/history/cobra/original-README.md
+new file mode 100644
+index 0000000..1440d52
+--- /dev/null
++++ b/history/cobra/original-README.md
+@@ -0,0 +1,37 @@
++# The game to port
++
++**Cobra Triangle** (Rare / Nintendo, 1989), the European (PAL) release for the NES. The ROM is
++`original/cobra.nes`; it is not in the repository (copyrighted; `.gitignore` keeps it and everything made from it out).
++
++- Mapper 7 (AxROM): 128 KB PRG as four 32 KB banks switched as a whole by a write to $8000-$FFFF, bit 4 of the
++  same register picks one of two one-screen nametables. 8 KB CHR RAM (no CHR ROM: the game writes its tiles).
++  NES 2.0 header says PAL: 50 frames a second, so one NES frame = one Amiga frame (no 60 to 50 Hz rescale).
++- Every bank has its own reset/NMI vectors. Common code at $FF80-$FFB6 is the same in all banks: a far call
++  trampoline ($FF80: switch, JSR $8000, switch back), bank switch-and-return ($FF9C), a delay loop ($FFB0).
++- NMI-driven: after start-up the main thread is a `JMP *` loop ($F73E, $A5E0, $A569, $CFF6). The NMI handler
++  runs the whole frame and ends in such a loop again with the stack reset (`LDX #$FD/$FF; TXS`).
++- Raster split: a fixed status bar under a 180-line playfield. In the NMI: sprite 0 at y=$B2 and a wait for its
++  hit (`LDA #$40; BIT $2002; BEQ`), then cycle-timed delay loops ($FFB0, $FD59) before the status bar's
++  scroll, one-screen page (bit 4 of the bank register) and PPUMASK writes at lines 180-194.
++- The playfield scrolls diagonally (both axes) in one 32x30 nametable; ~10 CHR RAM tiles rewritten per frame.
++- Self-playing mode: none (title, high scores, title again). The bench presses START at ticks 480 and 600 and
++  then steers and fires by script (`game_bench_input` in `src/logic.c`); play starts at tick ~740.
++- Controls: D-pad steers, A fires, B turbo, START pause.
++- Load (6502 instructions per frame outside wait and delay loops, `tools/nesref` with `WAITPCS`):
++  title/high scores 500-1,900 (spikes to 11k at screen changes, with rendering off);
++  play (bench ticks 750-3000): average 7,450, median 7,700, 90th percentile 8,400, max 8,700.
++
++## Feasibility note (milestones 2-3 of PIPELINE.md, written before the Amiga code)
++
++- Class and route: 6502 binary, translated once on the host (`tools/recomp.py`), 68k back end on the Amiga.
++- Logic: 7,450-8,700 6502 instructions per 50 Hz frame. At the playbook's 10-13 colour clocks each from chip RAM
++  that is 75k-113k colour clocks: more than the whole 71k frame. **A stock A1200 cannot hold 50 Hz; expect
++  roughly 25-35 fps shown, logic at 50 ticks.** With 4 MB fast RAM (5-6 colour clocks each): 37k-52k for logic,
++  against 57k at the 80% gate, leaving 5-20k for the display: 50 Hz only with hand-written hot routines
++  and a cheap display. Cheapest upgrade to name: fast RAM; a 68030 accelerator is the safe one.
++- Display: 4 bitplanes (16 NES background colours), hardware scroll in both axes over an unwrapped world, CHR RAM
++  tiles converted at run time when the game rewrites them, NES sprites on hardware sprites (fetch 0: sprites 0-6).
++  The status bar cannot be a raster split (the kit has none): it is drawn into the scrolling buffer under the
++  180-line playfield view each frame the scroll moves.
++- Cut from the original: the cycle-timed raster effects (their timing, not their result), lag frames (the
++  translated frame always finishes its logic; the NES lags ~1 frame in 750 in play), DMC samples.
+diff --git a/src/host_test.c b/src/host_test.c
+index 2b9f720..7e5dd10 100644
+--- a/src/host_test.c
++++ b/src/host_test.c
+@@ -3,6 +3,7 @@
+  *   host_test N            print the checksum after N ticks
+  *   host_test N -v         also print the checksum every 100 ticks (to find the first tick that differs)
+  *   host_test N -r file    also write NES RAM after every tick to file (for tools/verify)
++ *   host_test N -s       print the bench input as a tools/nesref -i script
+  *   host_test N -d t1,t2   also write the picture after these ticks as host_NNNNN.ppm (host_render.c)
+  */
+ #include <stdio.h>
+@@ -17,7 +18,8 @@ uint8_t nes_prg_data[0x20000], nes_chr_data[0x20000];
+ static void load(const char *name, uint8_t *dst)
+ {
+     FILE *f = fopen(name, "rb");
+-    if (!f || fread(dst, 1, 0x20000, f) != 0x20000) { fprintf(stderr, "cannot read %s (run tools/make_assets.sh)\n", name); exit(2); }
++    if (!f) { fprintf(stderr, "cannot read %s (run tools/make_assets.sh)\n", name); exit(2); }
++    if (fread(dst, 1, 0x20000, f)) {}         /* the ROM's size (CHR may be empty: CHR RAM) */
+     fclose(f);
+ }
+ 
+@@ -28,11 +30,21 @@ int main(int argc, char **argv)
+     FILE *ramlog = (argc > 3 && !strcmp(argv[2], "-r")) ? fopen(argv[3], "wb") : 0;
+     const char *dumps = (argc > 3 && !strcmp(argv[2], "-d")) ? argv[3] : 0;   /* -d 100,200,... : frames as PPM */
+     char key[32], name[64];
++    if (argc > 2 && !strcmp(argv[2], "-s")) {        /* -s: the bench input as a tools/nesref -i script */
++        static const char *names[8] = { "RIGHT", "LEFT", "DOWN", "UP", "A", "B", "START", "SELECT" };
++        for (t = 0; t < n; t++) { unsigned short in = game_bench_input(t); int b;
++            if (!in) continue;
++            printf("%u %u", t, t);
++            for (b = 0; b < 8; b++) if (in & (1 << b)) printf(" %s", names[b]);
++            printf("\n"); }
++        return 0;
++    }
+     load("assets/prg.bin", nes_prg_data);
+     load("assets/chr.bin", nes_chr_data);
+     game_init();
+     for (t = 0; t < n; t++) {
+         game_tick(game_bench_input(t));
++        if (argc > 2 && !strcmp(argv[2], "-c")) printf("%08x\n", (unsigned)game_trace_sum());   /* -c: every tick */
+         if (verbose && (t + 1) % 100 == 0) printf("tick %u checksum %08x frames %u\n", t + 1, (unsigned)game_checksum(), (unsigned)logic_frames);
+         if (ramlog) fwrite(nes_ram, 1, sizeof nes_ram, ramlog);
+         snprintf(key, sizeof key, ",%u,", t + 1);
+@@ -40,6 +52,6 @@ int main(int argc, char **argv)
+     }
+     if (nes_fatal_why) fprintf(stderr, "STOPPED: reason %d at %04x\n", nes_fatal_why, nes_fatal_pc);
+     if (ramlog) fclose(ramlog);
+-    printf("ticks=%u checksum=%08x\n", n, (unsigned)game_checksum());
++    if (!(argc > 2 && !strcmp(argv[2], "-c"))) printf("ticks=%u checksum=%08x\n", n, (unsigned)game_checksum());
+     return 0;
+ }
+diff --git a/src/logic.c b/src/logic.c
+index 5837c60..8ead6bc 100644
+--- a/src/logic.c
++++ b/src/logic.c
+@@ -6,13 +6,15 @@
+  * One tick = what the NES does between two vertical blanks: the NMI handler, then the main thread until it
+  * waits for the next frame again. The main thread runs as a coroutine and gives control back at its wait loops.
+  */
++#include <setjmp.h>
+ #include "nes.h"
+ #include "coro.h"
++#include "gen_code.h"                           /* NES_MAPPER, NES_CHR_SIZE: from the ROM header */
+ #include "logic.h"
+ #include "run.h"
+ 
+ extern const uint8_t nes_prg_data[];            /* 128 KB PRG ROM: assets/prg.bin */
+-extern const uint8_t nes_chr_data[];            /* 128 KB CHR ROM: assets/chr.bin */
++extern const uint8_t nes_chr_data[];            /* CHR ROM: assets/chr.bin (empty with CHR RAM) */
+ 
+ uint8_t logic_extra_pad;
+ #ifdef LOGIC_TRACE                              /* debug builds: the checksum after every tick */
+@@ -24,18 +26,39 @@ uint32_t (*logic_clock)(void);
+ uint32_t logic_frames;
+ static uint32_t co_stack[32768 / 4];            /* the NES main thread's C stack */
+ 
+-static void do_nmi(uint16_t pc)
++static jmp_buf idle_jb;                         /* nes_idle() drops the C stack back to nes_main() */
++static volatile uint16_t idle_pc;
++static int in_nmi;
++
++static void nmi_push(uint16_t pc)
+ {
+     uint8_t p = (uint8_t)((cpu_n & 0x80) | (cpu_v ? 0x40 : 0) | 0x20 | (cpu_d ? 8 : 0) | (cpu_i ? 4 : 0) | (cpu_z ? 0 : 2) | cpu_c);
+     nes_ram[0x100 + cpu_s] = (uint8_t)(pc >> 8); cpu_s--;
+     nes_ram[0x100 + cpu_s] = (uint8_t)pc; cpu_s--;
+     nes_ram[0x100 + cpu_s] = p; cpu_s--;
+     cpu_i = 1;
++}
++
++static void do_nmi(uint16_t pc)
++{
++    nmi_push(pc);
+     split_seen = 0;
++    in_nmi = 1;
+     if (run_nmi() != pc) nes_fatal(pc, 4);
++    in_nmi = 0;
+     split_on = split_seen;
+ }
+ 
++/* Called by the translated code at a loop that jumps to itself. Only an interrupt leaves it, and the NMI
++   handlers of NMI-driven games never return to it (they reset the stack), so the frame ends here and the C
++   stack below is dropped: nes_main() runs the next NMI from the top. */
++void nes_idle(uint16_t pc)
++{
++    if (in_nmi) { split_on = split_seen; in_nmi = 0; }
++    idle_pc = pc;
++    longjmp(idle_jb, 1);
++}
++
+ /* Called by the translated code in a loop that waits for the next frame. */
+ void nes_wait(int kind, uint16_t pc)
+ {
+@@ -47,7 +70,21 @@ void nes_wait(int kind, uint16_t pc)
+ 
+ static void nes_main(void)
+ {
+-    uint16_t pc = run_reset();
++    static uint16_t pc;
++    if (setjmp(idle_jb)) {                      /* the main thread idles at idle_pc */
++        co_yield();
++        logic_frames++;
++        if (!(ppu_ctrl & 0x80)) { pc = idle_pc; goto run; }   /* no NMI: it keeps idling */
++        nmi_push(idle_pc);
++        split_seen = 0;
++        in_nmi = 1;
++        pc = run_nmi();                         /* returns only through RTI */
++        in_nmi = 0;
++        split_on = split_seen;
++        goto run;
++    }
++    pc = run_reset();
++run:
+     for (;;) {
+         if (nes_fatal_why) co_yield();          /* stopped: keep the frame loop alive */
+         else pc = run_dispatch(pc);             /* a return nobody called from: continue there */
+@@ -56,7 +93,7 @@ static void nes_main(void)
+ 
+ void game_init(void)
+ {
+-    nes_init(nes_prg_data, nes_chr_data);
++    nes_init(nes_prg_data, NES_CHR_SIZE ? nes_chr_data : 0, NES_MAPPER);
+     co_init(nes_main, co_stack, sizeof co_stack);
+ }
+ 
+@@ -83,7 +120,7 @@ void game_tick(unsigned short in)
+ #ifdef LOGIC_NOSUM                              /* profiling builds: no checksum work in the ticks */
+     if (logic_ntrace < LOGIC_TRACE) logic_trace[logic_ntrace++] = 0;
+ #else
+-    if (logic_ntrace < LOGIC_TRACE) logic_trace[logic_ntrace++] = game_checksum();
++    if (logic_ntrace < LOGIC_TRACE) logic_trace[logic_ntrace++] = game_trace_sum();
+ #endif
+ #ifdef LOGIC_DUMP
+     if (logic_ntrace == LOGIC_DUMP) { int i; for (i = 0; i < 0x800; i++) logic_dump[i] = nes_ram[i];
+@@ -115,6 +152,24 @@ static uint32_t fnv(uint32_t h, const uint8_t *p, unsigned n)
+     return h;
+ }
+ 
++/* A cheaper checksum of the same state, for the per-tick traces of debug builds (tools/cmp_trace.py). */
++static uint32_t rsum(uint32_t h, const uint8_t *p, unsigned n)
++{
++    for (; n >= 2; n -= 2, p += 2) h = ((h << 3) | (h >> 29)) + (uint32_t)(p[0] << 8 | p[1]);
++    return h;
++}
++uint32_t game_trace_sum(void)
++{
++    uint8_t r[8];
++    uint32_t h = rsum(1, nes_ram, sizeof nes_ram);
++    h = rsum(h, nes_vram, sizeof nes_vram);
++    h = rsum(h, nes_pal, sizeof nes_pal);
++    h = rsum(h, nes_oam, sizeof nes_oam);
++    if (nes_chr == nes_chr_ram) h = rsum(h, nes_chr_ram, sizeof nes_chr_ram);
++    r[0] = cpu_a; r[1] = cpu_x; r[2] = cpu_y; r[3] = cpu_s; r[4] = nes_bank; r[5] = ppu_ctrl; r[6] = ppu_mask; r[7] = (uint8_t)nes_fatal_why;
++    return rsum(h, r, 8);
++}
++
+ uint32_t game_checksum(void)
+ {
+     uint32_t h = 2166136261u;
+@@ -123,6 +178,7 @@ uint32_t game_checksum(void)
+     h = fnv(h, nes_vram, sizeof nes_vram);
+     h = fnv(h, nes_pal, sizeof nes_pal);
+     h = fnv(h, nes_oam, sizeof nes_oam);
++    if (nes_chr == nes_chr_ram) h = fnv(h, nes_chr_ram, sizeof nes_chr_ram);
+     r[0] = cpu_a; r[1] = cpu_x; r[2] = cpu_y; r[3] = cpu_s; r[4] = nes_bank; r[5] = ppu_ctrl; r[6] = ppu_mask; r[7] = (uint8_t)nes_fatal_why;
+     return fnv(h, r, 8);
+ }
+diff --git a/src/logic.h b/src/logic.h
+index de6cfa6..cc077ac 100644
+--- a/src/logic.h
++++ b/src/logic.h
+@@ -17,6 +17,7 @@ void game_init(void);                           /* before the first tick: ROM po
+ void game_tick(unsigned short input);           /* one NES frame (1/60 s) of game logic */
+ unsigned short game_bench_input(unsigned int tick);
+ uint32_t game_checksum(void);
++uint32_t game_trace_sum(void);                  /* cheaper, for per-tick traces (debug builds) */
+ 
+ extern uint8_t logic_extra_pad;                 /* NES buttons from the keyboard, ORed into every tick */
+ extern uint32_t logic_frames;                   /* NES frames (NMIs) run so far */
+diff --git a/src/nes.c b/src/nes.c
+index a243cbc..33d418a 100644
+--- a/src/nes.c
++++ b/src/nes.c
+@@ -5,14 +5,18 @@
+ uint8_t cpu_a, cpu_x, cpu_y, cpu_s = 0xfd, cpu_c, cpu_z = 1, cpu_n, cpu_v, cpu_i = 1, cpu_d;
+ uint8_t nes_ram[0x800];
+ const uint8_t *nes_prg, *nes_chr, *nes_prg_lo, *nes_prg_hi;
+-uint8_t nes_bank;
++uint8_t nes_bank, nes_mapper = 1, ax_reg;
++uint16_t nt_map[4];
++uint8_t  nes_chr_ram[0x2000], chr_dirty_flag[512];
++uint16_t chr_dirty[512], chr_ndirty;
+ uint16_t nes_fatal_pc; int nes_fatal_why;
+ 
+ uint8_t nes_vram[0x800], nes_pal[32], nes_oam[256];
+ uint8_t ppu_ctrl, ppu_mask, ppu_fx, ppu_vbl;
+ uint16_t ppu_t;
+ uint16_t ppu_v;                                 /* also used by the 68k fast path in src/nes68k.s */
+-static uint8_t ppu_w, ppu_oamaddr, ppu_rdbuf, ppu_s0;
++uint8_t ppu_w, ppu_oamaddr, ppu_rdbuf;          /* also used by the 68k fast paths in src/nes68k.s */
++static uint8_t ppu_s0;
+ uint8_t mmc_ctrl = 0x0c, mmc_chr0, mmc_chr1, mmc_prg;
+ uint8_t mmc_shift = 0x10;                       /* also used by the 68k fast paths in src/nes68k.s */
+ 
+@@ -21,6 +25,7 @@ uint16_t nes_ndirty;
+ uint8_t  nes_dirty_flag[0x800];
+ uint8_t  nes_redraw_all = 1, nes_pal_dirty = 1;
+ 
++uint8_t  split_ax, split_mask, split_pal0;
+ uint8_t  split_on, split_ctrl, split_chr0, split_chr1, split_fx, split_line, split_seen;
+ uint16_t split_t;
+ 
+@@ -28,8 +33,29 @@ uint8_t apu_reg[0x18], apu_trig;
+ uint8_t nes_pad;
+ uint8_t pad_shift, pad_strobe;                 /* also used by src/nes68k.s */
+ 
++static void set_mirroring(void)
++{
++    int i;
++    for (i = 0; i < 4; i++) {
++        if (nes_mapper == 7) nt_map[i] = (ax_reg & 0x10) ? 0x400 : 0;
++        else switch (mmc_ctrl & 3) {
++        case 0: nt_map[i] = 0; break;
++        case 1: nt_map[i] = 0x400; break;
++        case 2: nt_map[i] = (uint16_t)((i & 1) << 10); break;       /* vertical */
++        default: nt_map[i] = (uint16_t)((i >> 1) << 10); break;     /* horizontal */
++        }
++    }
++}
++
+ static void map_prg(void)
+ {
++    if (nes_mapper == 7) {
++        nes_bank = ax_reg & 3;
++        nes_prg_lo = nes_prg + nes_bank * 0x8000;
++        nes_prg_hi = nes_prg_lo + 0x4000;
++        return;
++    }
++    {
+     int mode = (mmc_ctrl >> 2) & 3, b = mmc_prg & 0x0f;
+     int lo, hi;
+     if (mode < 2) { lo = b & 0x0e; hi = lo | 1; }
+@@ -39,12 +65,15 @@ static void map_prg(void)
+     nes_bank = (uint8_t)lo;
+     nes_prg_lo = nes_prg + lo * 0x4000;
+     nes_prg_hi = nes_prg + hi * 0x4000;
++    }
+ }
+ 
+-void nes_init(const uint8_t *prg, const uint8_t *chr)
++void nes_init(const uint8_t *prg, const uint8_t *chr, int mapper)
+ {
+-    nes_prg = prg; nes_chr = chr;
++    nes_mapper = (uint8_t)mapper;
++    nes_prg = prg; nes_chr = chr ? chr : nes_chr_ram;
+     map_prg();
++    set_mirroring();
+ }
+ 
+ void nes_fatal(uint16_t pc, int why)
+@@ -55,13 +84,7 @@ void nes_fatal(uint16_t pc, int why)
+ /* index into nes_vram for a PPU address $2000-$2FFF, after mirroring */
+ static uint16_t nt_index(uint16_t a)
+ {
+-    a &= 0xfff;
+-    switch (mmc_ctrl & 3) {
+-    case 0: return a & 0x3ff;
+-    case 1: return 0x400 | (a & 0x3ff);
+-    case 2: return a & 0x7ff;
+-    default: return ((a >> 1) & 0x400) | (a & 0x3ff);
+-    }
++    return (uint16_t)(nt_map[(a >> 10) & 3] | (a & 0x3ff));
+ }
+ 
+ static void mark(uint16_t i)
+@@ -83,7 +106,13 @@ static void vram_write(uint8_t v)
+     } else if (a >= 0x2000) {
+         uint16_t i = nt_index(a);
+         if (nes_vram[i] != v) { nes_vram[i] = v; mark(i); }
+-    }                                           /* CHR is ROM: writes below $2000 are ignored */
++    } else if (nes_chr == nes_chr_ram) {        /* CHR RAM: remember which tiles changed for the display */
++        if (nes_chr_ram[a] != v) {
++            uint16_t t = a >> 4;
++            nes_chr_ram[a] = v;
++            if (!chr_dirty_flag[t]) { chr_dirty_flag[t] = 1; chr_dirty[chr_ndirty++] = t; }
++        }
++    }                                           /* CHR ROM: writes below $2000 are ignored */
+     ppu_v += (ppu_ctrl & 4) ? 32 : 1;
+ }
+ 
+@@ -93,7 +122,7 @@ static uint8_t vram_read(void)
+     uint8_t r = ppu_rdbuf, d;
+     if (a < 0x2000) {
+         uint16_t bank = (mmc_ctrl & 0x10) ? ((a < 0x1000) ? mmc_chr0 : mmc_chr1) : ((mmc_chr0 & 0x1e) | (a >> 12));
+-        d = nes_chr[(uint32_t)(bank & 31) * 0x1000 + (a & 0xfff)];
++        d = nes_chr == nes_chr_ram ? nes_chr_ram[a] : nes_chr[(uint32_t)(bank & 31) * 0x1000 + (a & 0xfff)];
+     } else d = nes_vram[nt_index(a)];
+     if (a >= 0x3f00) { uint16_t p = a & 0x1f; if ((p & 0x13) == 0x10) p &= 0x0f; r = nes_pal[p]; }
+     ppu_rdbuf = d;
+@@ -129,7 +158,7 @@ uint8_t nes_read_s0(void)
+     if (ppu_s0) {
+         split_seen = 1;
+         split_ctrl = ppu_ctrl; split_chr0 = mmc_chr0; split_chr1 = mmc_chr1; split_t = ppu_t; split_fx = ppu_fx;
+-        split_line = nes_oam[0];
++        split_line = nes_oam[0]; split_ax = ax_reg; split_mask = ppu_mask; split_pal0 = nes_pal[0];
+     }
+     ppu_vbl = 0; ppu_w = 0; ppu_s0 ^= 1;
+     return r;
+@@ -149,6 +178,7 @@ void nes_mmc_ctrl(uint8_t v)
+     if ((v ^ mmc_ctrl) & 0x03) nes_redraw_all = 1;
+     mmc_ctrl = v;
+     map_prg();
++    set_mirroring();
+     mmc_shift = 0x10;
+ }
+ 
+@@ -161,7 +191,7 @@ static void mmc1(uint16_t a, uint8_t v)
+         if (done) {
+             uint8_t val = mmc_shift;
+             switch ((a >> 13) & 3) {
+-            case 0: if ((val ^ mmc_ctrl) & 0x03) nes_redraw_all = 1; mmc_ctrl = val; break;   /* mirroring */
++            case 0: if ((val ^ mmc_ctrl) & 0x03) nes_redraw_all = 1; mmc_ctrl = val; set_mirroring(); break;   /* mirroring */
+             case 1: mmc_chr0 = val; break;          /* tile sets: the display compares what it drew with */
+             case 2: mmc_chr1 = val; break;
+             default: mmc_prg = val; break;
+@@ -207,5 +237,8 @@ void nes_write_slow(uint16_t a, uint8_t v)
+         }
+         return;
+     }
+-    if (a >= 0x8000) mmc1(a, v);                /* $4020-$7FFF: nothing there on this board */
++    if (a >= 0x8000) {                          /* $4020-$7FFF: nothing there on these boards */
++        if (nes_mapper == 7) { ax_reg = v; map_prg(); set_mirroring(); }   /* AxROM: one register, no bus conflicts modelled */
++        else mmc1(a, v);
++    }
+ }
+diff --git a/src/nes.h b/src/nes.h
+index 06885ca..b6b481d 100644
+--- a/src/nes.h
++++ b/src/nes.h
+@@ -15,14 +15,17 @@ extern const uint8_t *nes_prg;          /* whole PRG ROM, 8 x 16 KB */
+ extern const uint8_t *nes_chr;          /* whole CHR ROM, 128 KB = 32 banks of 4 KB */
+ extern const uint8_t *nes_prg_lo;       /* the 16 KB bank mapped at $8000 */
+ extern const uint8_t *nes_prg_hi;       /* the fixed last bank at $C000 */
+-extern uint8_t nes_bank;                /* number of the bank at $8000 */
++extern uint8_t nes_bank;                /* number of the bank at $8000 (MMC1: 16 KB bank, AxROM: 32 KB bank) */
++extern uint8_t nes_mapper;              /* 1 = MMC1, 7 = AxROM (32 KB PRG banks, CHR RAM, one-screen mirroring) */
++extern uint8_t ax_reg;                  /* AxROM: the last value written to the bank register */
++extern uint16_t nt_map[4];              /* nametable $2000/$2400/$2800/$2C00 -> offset in nes_vram (mirroring) */
+ 
+ uint8_t nes_io_read(uint16_t a);                /* $2000-$7FFF */
+ uint8_t nes_read_s0(void);                      /* $2002 read by a loop that waits for the sprite 0 hit */
+ void    nes_write_slow(uint16_t a, uint8_t v);  /* everything at $2000 and above */
+ void    nes_mmc_prg(uint8_t v);                 /* MMC1 PRG register in one step (src/nes68k.s) */
+ void    nes_mmc_ctrl(uint8_t v);                /* MMC1 control register in one step */
+-void    nes_init(const uint8_t *prg, const uint8_t *chr);
++void    nes_init(const uint8_t *prg, const uint8_t *chr, int mapper);   /* chr 0: 8 KB CHR RAM */
+ void    nes_fatal(uint16_t pc, int why);        /* translated code reached something it cannot do */
+ extern uint16_t nes_fatal_pc; extern int nes_fatal_why;
+ 
+@@ -48,6 +51,12 @@ extern uint8_t mmc_ctrl, mmc_chr0, mmc_chr1, mmc_prg;
+ extern uint8_t ppu_vbl;                 /* vertical blank flag, as read from $2002 */
+ 
+ /* What changed since the display last looked (the display clears these). */
++/* CHR RAM (AxROM): the pattern tables the game writes through $2007, and which 16-byte tiles changed */
++extern uint8_t  nes_chr_ram[0x2000];
++extern uint8_t  chr_dirty_flag[512];
++extern uint16_t chr_dirty[512];
++extern uint16_t chr_ndirty;
++
+ #define NES_DIRTY_MAX 1024
+ extern uint16_t nes_dirty[NES_DIRTY_MAX];       /* nametable cells (0..0x7ff, attribute cells included) */
+ extern uint16_t nes_ndirty;
+@@ -60,6 +69,8 @@ extern uint8_t  nes_pal_dirty;
+ extern uint8_t  split_on, split_ctrl, split_chr0, split_chr1, split_fx, split_line;
+ extern uint16_t split_t;
+ extern uint8_t  split_seen;                     /* a split happened in the NMI that just ran */
++extern uint8_t  split_ax;                       /* AxROM: the bank register (one-screen page in bit 4) above the split */
++extern uint8_t  split_mask, split_pal0;         /* PPUMASK and the backdrop colour above the split */
+ 
+ /* APU: the register file, and which channels were (re)started this frame. The Amiga side plays it. */
+ extern uint8_t apu_reg[0x18];
+@@ -72,6 +83,8 @@ extern uint8_t nes_pad;
+ uint16_t nes_dispatch(uint16_t pc);             /* generated: run the code at pc (in the mapped bank), return the next pc */
+ uint16_t nes_reset_entry(void);
+ void     nes_wait(int kind, uint16_t pc);       /* logic.c: the game waits for the next frame here */
++void     nes_idle(uint16_t pc);                 /* logic.c: a loop that jumps to itself: nothing but the NMI
++                                                   continues, so the frame ends and the C stack is dropped */
+ #define WAIT_RAM 0
+ #define WAIT_VBL 1
+ 
+diff --git a/src/nes68k.s b/src/nes68k.s
+index 753d82f..f9f3435 100644
+--- a/src/nes68k.s
++++ b/src/nes68k.s
+@@ -11,6 +11,8 @@
+ ;       _cpu_x,_cpu_y,_cpu_s,_cpu_c,_cpu_z,_cpu_n,_cpu_v,_cpu_i,_cpu_d
+         xref    _nes_ram,_nes_prg_lo,_nes_prg_hi,_nes_prg_data,_ppu_v,_ppu_ctrl,_nes_vram,_nes_dirty,_nes_dirty_flag,_nes_ndirty,_nes_redraw_all,_nes_bank,_mmc_shift,_mmc_chr0,_mmc_chr1,_mmc_ctrl,_mmc_prg,_pad_shift,_pad_strobe,_nes_pad
+         xref    _nes_io_read,_nes_read_s0,_nes_write_slow,_nes_wait,_nes_fatal,_nes_mmc_prg,_nes_mmc_ctrl
++        xref    _ppu_w,_ppu_oamaddr,_ppu_rdbuf,_ppu_t,_ppu_fx,_ppu_mask,_nes_oam
++        xref    _nes_idle,_nes_mapper,_ax_reg,_nt_map,_nes_chr_ram,_chr_dirty_flag,_chr_dirty,_chr_ndirty,_nes_prg_hi
+ 
+ ; ---- moving the 6502 state between the globals and the registers
+ _load_state:
+@@ -25,7 +27,7 @@ _load_state:
+         move.b  _cpu_s,d4
+         lea     ($81,a5,d4.w),a2
+         move.l  _nes_prg_lo,a3
+-        lea     _nes_prg_data+$1c000,a4
++        move.l  _nes_prg_hi,a4
+         move.b  _cpu_v,d5
+         moveq   #0,d4
+         tst.b   _cpu_c
+@@ -120,8 +122,10 @@ _dispatch:
+         moveq   #0,d0
+         move.w  d7,d0                   ; address
+         moveq   #7,d1                   ; bank: 7 = the fixed one
++        ifeq    AXROM
+         cmp.l   #$c000,d0
+         bcc.s   .h
++        endc
+         cmp.l   #$8000,d0
+         bcs.s   .nf
+         move.b  _nes_bank,d1
+@@ -163,6 +167,13 @@ _fatal:                                 ; d7.w = address, d4 = reason: tell C, t
+         moveq   #0,d7
+         jmp     2(a0)
+ 
++; ---- a loop that jumps to itself (a1): the frame ends, nes_idle() never returns (it drops the C stack)
++_idle:  bsr     _store_state
++        move.l  a1,d4
++        and.l   #$ffff,d4
++        move.l  d4,-(sp)
++        jsr     _nes_idle
++
+ ; ---- frame boundary: a1 = address of the wait loop (an address register: loading it leaves the flags)
+ _wait_ram:
+         pea     0.w
+@@ -183,6 +194,47 @@ _wait:  bsr     _store_state
+ ; ---- memory that is not plain RAM or ROM. All keep d0-d3, d5-d7, a0-a6 and the flags.
+ _io_rd:                                 ; a0 = address -> d4
+         move.w  ccr,-(sp)
++        cmpa.w  #$4017,a0               ; second controller: nothing there
++        bne.s   .r7
++        moveq   #$40,d4
++        move.w  (sp)+,ccr
++        rts
++.r7     cmpa.w  #$2007,a0               ; PPU data: nametable and CHR RAM reads, as vram_read() does them
++        bne     .r16
++        move.w  _ppu_v,d3
++        and.w   #$3fff,d3
++        cmp.w   #$3f00,d3
++        bcc     .slow
++        movem.l d0/a1,-(sp)
++        cmp.w   #$2000,d3
++        bcc.s   .rnt
++        cmp.b   #7,_nes_mapper
++        bne.s   .rslow
++        lea     _nes_chr_ram,a1
++        move.b  (a1,d3.w),d0
++        bra.s   .rgot
++.rnt    move.w  d3,d0
++        rol.w   #6,d0
++        and.w   #3,d0
++        add.w   d0,d0
++        lea     _nt_map,a1
++        and.w   #$3ff,d3
++        or.w    (a1,d0.w),d3
++        lea     _nes_vram,a1
++        move.b  (a1,d3.w),d0
++.rgot   move.b  _ppu_rdbuf,d4
++        move.b  d0,_ppu_rdbuf
++        moveq   #1,d3
++        btst    #2,_ppu_ctrl
++        beq.s   .ri
++        moveq   #32,d3
++.ri     add.w   d3,_ppu_v
++        movem.l (sp)+,d0/a1
++        move.w  (sp)+,ccr
++        rts
++.rslow  movem.l (sp)+,d0/a1
++        bra.s   .slow
++.r16
+         cmpa.w  #$4016,a0               ; the controller: done here, as nes_io_read() does it
+         bne.s   .slow
+         move.b  _pad_shift,d4
+@@ -229,6 +281,7 @@ _io_wr_d2:
+         movem.l d0-d1/a0-a1,-(sp)
+         moveq   #0,d4
+         move.b  d2,d4
++        bra     _io_wr                  ; (the previous port fell into _set_prg here: STY to I/O never ran)
+ _set_prg:                               ; d4 = new MMC1 PRG register: as five serial writes would leave it
+         move.w  ccr,-(sp)
+         move.b  _mmc_ctrl,d3
+@@ -271,19 +324,21 @@ _io_wr_d4:
+         move.w  ccr,-(sp)
+         movem.l d0-d1/a0-a1,-(sp)
+         and.l   #$ff,d4
+-_io_wr: cmpa.w  #$2007,a0               ; PPU data port: nametable writes done here, as vram_write() in nes.c
++_io_wr: cmpa.w  #$2007,a0               ; PPU data port: nametable and CHR RAM writes done here, as vram_write() in nes.c
+         bne     .nt9
+-        move.b  _mmc_ctrl,d3
+-        and.b   #3,d3
+-        cmp.b   #2,d3                   ; vertical mirroring only (the game's)
+-        bne     .call
+         move.w  _ppu_v,d3
+         and.w   #$3fff,d3
+-        cmp.w   #$2000,d3
+-        bcs     .call
+         cmp.w   #$3f00,d3
+         bcc     .call
+-        and.w   #$7ff,d3                ; nametable cell
++        cmp.w   #$2000,d3
++        bcs     .chr
++        move.w  d3,d0                   ; nametable cell: nt_map[(v >> 10) & 3] | (v & $3ff)
++        rol.w   #6,d0
++        and.w   #3,d0
++        add.w   d0,d0
++        lea     _nt_map,a0
++        and.w   #$3ff,d3
++        or.w    (a0,d0.w),d3
+         lea     _nes_vram,a0
+         cmp.b   (a0,d3.w),d4
+         beq.s   .inc
+@@ -307,8 +362,93 @@ _io_wr: cmpa.w  #$2007,a0               ; PPU data port: nametable writes done h
+         moveq   #32,d3
+ .i1     add.w   d3,_ppu_v
+         bra     .done
+-.nt9    cmpa.l  #$8000,a0               ; MMC1: four of the five serial writes only shift
++.chr    cmp.b   #7,_nes_mapper          ; CHR RAM (AxROM): store, and remember the 16-byte tile for the display
++        bne.s   .inc                    ; CHR ROM: the write does nothing
++        lea     _nes_chr_ram,a0
++        cmp.b   (a0,d3.w),d4
++        beq.s   .inc
++        move.b  d4,(a0,d3.w)
++        lsr.w   #4,d3
++        lea     _chr_dirty_flag,a0
++        tst.b   (a0,d3.w)
++        bne.s   .inc
++        move.b  #1,(a0,d3.w)
++        move.w  _chr_ndirty,d0
++        add.w   d0,d0
++        lea     _chr_dirty,a0
++        move.w  d3,(a0,d0.w)
++        addq.w  #1,_chr_ndirty
++        bra.s   .inc
++.nt9    cmpa.w  #$2007,a0               ; the other PPU registers, as nes_write_slow() does them
++        bcc     .nt10
++        cmpa.w  #$2000,a0
++        bcs     .nt10
++        move.w  a0,d3
++        sub.w   #$2000,d3
++        add.w   d3,d3
++        move.w  .ppu(pc,d3.w),d3
++        jmp     .ppu(pc,d3.w)
++.ppu    dc.w    .w0-.ppu,.w1-.ppu,.call-.ppu,.w3-.ppu,.w4-.ppu,.w5-.ppu,.w6-.ppu
++.w0     move.b  d4,_ppu_ctrl
++        move.w  _ppu_t,d3
++        and.w   #$f3ff,d3
++        and.w   #3,d4
++        lsl.w   #8,d4
++        lsl.w   #2,d4
++        or.w    d4,d3
++        move.w  d3,_ppu_t
++        bra     .done
++.w1     move.b  d4,_ppu_mask
++        bra     .done
++.w3     move.b  d4,_ppu_oamaddr
++        bra     .done
++.w4     moveq   #0,d3
++        move.b  _ppu_oamaddr,d3
++        lea     _nes_oam,a0
++        move.b  d4,(a0,d3.w)
++        addq.b  #1,_ppu_oamaddr
++        bra     .done
++.w5     move.w  _ppu_t,d3
++        tst.b   _ppu_w
++        bne.s   .w5b
++        move.b  d4,d0
++        and.b   #7,d0
++        move.b  d0,_ppu_fx
++        and.w   #$ffe0,d3
++        lsr.b   #3,d4
++        or.w    d4,d3
++        bra.s   .w5c
++.w5b    and.w   #$8c1f,d3
++        move.w  d4,d0
++        and.w   #7,d0
++        ror.w   #4,d0                   ; << 12
++        or.w    d0,d3
++        and.w   #$f8,d4
++        lsl.w   #2,d4
++        or.w    d4,d3
++.w5c    move.w  d3,_ppu_t
++        eori.b  #1,_ppu_w
++        bra     .done
++.w6     move.w  _ppu_t,d3
++        tst.b   _ppu_w
++        bne.s   .w6b
++        and.w   #$00ff,d3
++        and.w   #$3f,d4
++        lsl.w   #8,d4
++        or.w    d4,d3
++        move.w  d3,_ppu_t
++        eori.b  #1,_ppu_w
++        bra     .done
++.w6b    and.w   #$ff00,d3
++        or.b    d4,d3
++        move.w  d3,_ppu_t
++        move.w  d3,_ppu_v
++        eori.b  #1,_ppu_w
++        bra     .done
++.nt10   cmpa.l  #$8000,a0               ; MMC1: four of the five serial writes only shift
+         bcs     .pad
++        cmp.b   #7,_nes_mapper
++        beq     .ax
+         btst    #7,d4
+         bne     .call
+         move.b  _mmc_shift,d3
+@@ -328,11 +468,36 @@ _io_wr: cmpa.w  #$2007,a0               ; PPU data port: nametable writes done h
+         beq     .done
+         move.b  _nes_pad,_pad_shift
+         bra     .done
++.ax     move.b  _ax_reg,d3              ; AxROM bank register: 32 KB bank, one-screen page in bit 4
++        move.b  d4,_ax_reg
++        eor.b   d4,d3
++        and.l   #3,d4
++        move.b  d4,_nes_bank
++        moveq   #15,d0
++        lsl.l   d0,d4                   ; bank * $8000
++        lea     _nes_prg_data,a3
++        adda.l  d4,a3
++        move.l  a3,_nes_prg_lo
++        lea     $4000(a3),a4
++        move.l  a4,_nes_prg_hi
++        btst    #4,d3
++        beq.s   .done
++        moveq   #0,d0
++        btst    #4,_ax_reg
++        beq.s   .ax1
++        move.w  #$400,d0
++.ax1    lea     _nt_map,a0
++        move.w  d0,(a0)+
++        move.w  d0,(a0)+
++        move.w  d0,(a0)+
++        move.w  d0,(a0)+
++        bra.s   .done
+ .call   move.l  d4,-(sp)
+         move.l  a0,-(sp)
+         jsr     _nes_write_slow
+         addq.l  #8,sp
+         move.l  _nes_prg_lo,a3          ; a mapper write may have switched the bank
++        move.l  _nes_prg_hi,a4
+ .done   movem.l (sp)+,d0-d1/a0-a1
+         move.w  (sp)+,ccr
+         rts
+diff --git a/src/run68k.c b/src/run68k.c
+index cad9ffc..f9cab2e 100644
+--- a/src/run68k.c
++++ b/src/run68k.c
+@@ -6,5 +6,5 @@ extern void *reset_fn, *nmi_fn;                 /* src/gen68k.s */
+ uint16_t asm_run(void *fn);                     /* src/nes68k.s */
+ uint16_t asm_dispatch(unsigned pc);
+ uint16_t run_reset(void) { return asm_run(reset_fn); }
+-uint16_t run_nmi(void) { return asm_run(nmi_fn); }
++uint16_t run_nmi(void) { return asm_dispatch((uint16_t)(nes_rd(0xfffa) | nes_rd(0xfffb) << 8)); }   /* the vector of the mapped bank */
+ uint16_t run_dispatch(uint16_t pc) { return asm_dispatch(pc); }
+diff --git a/src/run_c.c b/src/run_c.c
+index 2f88af5..5b77eaf 100644
+--- a/src/run_c.c
++++ b/src/run_c.c
+@@ -3,5 +3,5 @@
+ #include "run.h"
+ #include "gen_code.h"
+ uint16_t run_reset(void) { return nes_reset_entry(); }
+-uint16_t run_nmi(void) { return NES_NMI_FN(); }
++uint16_t run_nmi(void) { return nes_dispatch((uint16_t)(nes_rd(0xfffa) | nes_rd(0xfffb) << 8)); }   /* the vector of the mapped bank */
+ uint16_t run_dispatch(uint16_t pc) { return nes_dispatch(pc); }
+diff --git a/src/video68k.s b/src/video68k.s
+index 4ace87b..80fea19 100644
+--- a/src/video68k.s
++++ b/src/video68k.s
+@@ -5,8 +5,9 @@
+ 
+ ; void tile8(UBYTE *d __asm("a0"), const UBYTE *chr __asm("a1"), ULONG attr __asm("d0"))
+ ; One 8x8 NES tile into 4 bitplanes, 64 bytes a line: planes 0-1 from the CHR tile (8 bytes plane 0,
+-; 8 bytes plane 1), planes 2-3 filled with the attribute bytes in attr bits 0-7 and 8-15.
+-_tile8: movem.l d2-d3/a2-a4,-(sp)
++; 8 bytes plane 1), planes 2-3 the attribute bytes in attr bits 0-7 and 8-15, only under the tile's
++; non-zero pixels: a colour-0 pixel is colour 0 whatever its palette (the NES shows the backdrop there).
++_tile8: movem.l d2-d5/a2-a4,-(sp)
+         move.l  _video_plane,d2
+         lea     (a0,d2.l),a2
+         lea     (a2,d2.l),a3
+@@ -14,16 +15,22 @@ _tile8: movem.l d2-d3/a2-a4,-(sp)
+         move.w  d0,d1
+         lsr.w   #8,d1                   ; plane 3 byte
+         moveq   #7,d3
+-.l      move.b  8(a1),(a2)
+-        move.b  (a1)+,(a0)
+-        move.b  d0,(a3)
+-        move.b  d1,(a4)
++.l      move.b  8(a1),d4
++        move.b  (a1)+,d5
++        move.b  d5,(a0)
++        move.b  d4,(a2)
++        or.b    d5,d4
++        move.b  d4,d5
++        and.b   d0,d4
++        and.b   d1,d5
++        move.b  d4,(a3)
++        move.b  d5,(a4)
+         lea     64(a0),a0
+         lea     64(a2),a2
+         lea     64(a3),a3
+         lea     64(a4),a4
+         dbf     d3,.l
+-        movem.l (sp)+,d2-d3/a2-a4
++        movem.l (sp)+,d2-d5/a2-a4
+         rts
+ 
+ ; void spr_put(UBYTE *e __asm("a0"), UBYTE *o __asm("a1"), const UBYTE *chr __asm("a2"), ULONG ctl __asm("d0"))
+diff --git a/tools/back68k.py b/tools/back68k.py
+index f840948..40afce1 100644
+--- a/tools/back68k.py
++++ b/tools/back68k.py
+@@ -39,6 +39,7 @@ def generate(g):
+     FIXED, NORETURN, static_branch, successors = g['FIXED'], g['NORETURN'], g['static_branch'], g['successors']
+     wait_kind, rd, outdir = g['wait_kind'], g['rd'], g['outdir']
+     reset, nmi, irq, dynamic = g['reset'], g['nmi'], g['irq'], g['dynamic_entries']
++    AX, mapper_write, bank_check, RESET_BANK = g['AX'], g['mapper_write'], g['bank_check'], g['RESET_BANK']
+ 
+     def fname(ctx, a): return 'F%d_%04x' % (ctx_of(ctx, a), a)
+     banks_for = collections.defaultdict(list)
+@@ -47,6 +48,7 @@ def generate(g):
+ 
+     def callees(ctx, at, t):
+         """the functions a JSR at 'at' to t can reach"""
++        if AX: return [(ctx, t)] if (ctx, t) in entries else []
+         if t >= 0xc000: return [(FIXED, t)]
+         if t < 0x8000: return []
+         if ctx != FIXED and at < 0xc000: return [(ctx, t)] if (ctx, t) in entries else []
+@@ -75,6 +77,7 @@ def generate(g):
+         funcs[(ctx, e)] = dict(ctx=ctx, entry=e, addrs=addrs, aset=aset, info=info)
+ 
+     def tail_fns(ctx, at, t):
++        if AX: return [(ctx, t)] if (ctx, t) in entries else []
+         if t >= 0xc000: return [(FIXED, t)]
+         if t < 0x8000: return []
+         if ctx != FIXED and at < 0xc000: return [(ctx, t)]
+@@ -188,6 +191,7 @@ def generate(g):
+ 
+     def call_target(ctx, at, t):
+         """label for bsr/jmp to the code at t"""
++        if AX: return fname(ctx, t) if (ctx, t) in entries else dynstub(t)
+         if t >= 0xc000: return fname(FIXED, t)
+         if t < 0x8000: return dynstub(t)
+         if ctx != FIXED and at < 0xc000 and (ctx, t) in entries: return fname(ctx, t)
+@@ -273,7 +277,8 @@ def generate(g):
+             d = f['info'][a]['d']
+             if d and d[1] == 'rel' and d[2] <= a and d[2] in aset:
+                 kd = wait_kind(ctx, d[2], a)
+-                if kd in ('RAM', 'VBL'): waits[a] = (kd, d[2])
++                if kd in ('RAM', 'VBL', 'IDLE'): waits[a] = (kd, d[2])
++            if d and d[0] == 'JMP' and d[1] == 'abs' and d[2] == a: waits[a] = ('IDLE', a)
+         s0 = set()
+         for a in addrs:
+             d = f['info'][a]['d']
+@@ -439,7 +444,8 @@ def generate(g):
+                 if a in waits:
+                     kd, lp = waits[a]
+                     st = newstub()
+-                    stubs.append((st, ['lea $%04x.l,a1' % lp, 'bsr _wait_%s' % kd.lower(), 'bra .L%04x' % lp]))
++                    if kd == 'IDLE': stubs.append((st, ['lea $%04x.l,a1' % lp, 'bra _idle']))
++                    else: stubs.append((st, ['lea $%04x.l,a1' % lp, 'bsr _wait_%s' % kd.lower(), 'bra .L%04x' % lp]))
+                     tgt = st
+                 if sb is True:
+                     L.append('bra %s' % tgt)
+@@ -474,7 +480,8 @@ def generate(g):
+                 keep_c = True
+                 fuse = None
+             elif m == 'JMP':
+-                if mode == 'abs':
++                if a in waits: L += ['lea $%04x.l,a1' % a, 'bra _idle']
++                elif mode == 'abs':
+                     L.append(('bra %s' if arg in aset else 'jmp %s') % goto(arg, a))
+                 else:
+                     hi = (arg & 0xff00) | ((arg + 1) & 0xff)
+@@ -494,6 +501,10 @@ def generate(g):
+                 push = ['move.w #$%04x,-(a2)' % sw]
+                 if el & NZ: push = ['move.w ccr,d6'] + push + ['move.w d6,ccr']
+                 L += push + ['bsr %s' % call_target(ctx, a, arg), 'dc.w $%04x' % sw]
++                if bank_check(ctx, arg):            # AxROM: the callee may have left another bank mapped
++                    st = newstub()
++                    stubs.append((st, ['move.w d6,ccr', 'jmp %s' % dynstub((ret + 1) & 0xffff)]))
++                    L += ['move.w ccr,d6', 'cmpa.l #_nes_prg_data+$%x,a3' % (ctx * 0x8000), 'bne %s' % st, 'move.w d6,ccr']
+                 nzsrc = None; c68 = None
+             elif m == 'RTS':
+                 if exit_live[k] & NZ: L += ['move.w ccr,d6', 'movea.l (sp)+,a0', 'cmpm.w (a2)+,(a0)+', 'bne _unwind', 'move.w d6,ccr', 'jmp (a0)']
+@@ -504,9 +515,11 @@ def generate(g):
+                 L += ['move.w #$%04x,d7' % a, 'bra _fatal_op']
+             else:
+                 raise ValueError(m)
++            if mapper_write(d):                     # AxROM: the rest runs in the bank just mapped
++                L.append('jmp %s' % dynstub(fall))
+             if keep_c is not True and keep_c != 'set': known_c = None
+             # fall through into an instruction that is not the next one written
+-            ft = bool(i['succ'] and fall in i['succ']) or (fall in i['tails'])
++            ft = (bool(i['succ'] and fall in i['succ']) or (fall in i['tails'])) and not mapper_write(d)
+             if ft and m not in ('JMP', 'RTS', 'RTI', 'BRK') and not (m == 'JSR' and arg in NORETURN) and nxt != fall:
+                 if mode == 'rel' and static_branch(ctx, a, i['prev']) is True: pass
+                 elif fall in aset: L.append('bra .L%04x' % fall)
+@@ -547,11 +560,12 @@ def generate(g):
+     E('_disp_hash:')
+     for sl in slots:
+         E('    dc.w 0,0,0,0' if sl is None else '    dc.w $%04x,%d\n    dc.l %s' % (sl[1], sl[0], fname(sl[0], sl[1])))
+-    E('_reset_fn: dc.l %s' % fname(FIXED, reset))
+-    E('_nmi_fn: dc.l %s' % fname(FIXED, nmi))
++    E('_reset_fn: dc.l %s' % fname(RESET_BANK, reset))
++    E('_nmi_fn: dc.l %s' % fname(RESET_BANK, nmi))
+ 
+     with open(os.path.join(outdir, 'gen68k.s'), 'w') as fo:
+         fo.write('; generated by tools/recomp.py (back68k.py) from the game ROM: do not edit\n')
++        fo.write('AXROM = %d\n' % (1 if AX else 0))
+         fo.write('    section gencode,code\n')
+         fo.write('    xdef _disp_hash,_reset_fn,_nmi_fn\n')
+         fo.write('\n'.join(out) + '\n')
+diff --git a/tools/cmp_trace.py b/tools/cmp_trace.py
+new file mode 100644
+index 0000000..9687fb8
+--- /dev/null
++++ b/tools/cmp_trace.py
+@@ -0,0 +1,10 @@
++#!/usr/bin/env python3
++"""cmp_trace.py trace.bin N - compare the Amiga's per-tick checksums (tools/debug_run.sh) with the host test's."""
++import sys, struct, subprocess
++tr = open(sys.argv[1], 'rb').read(); n = len(tr) // 4
++am = struct.unpack('>%dI' % n, tr)
++out = subprocess.run(['out/host_test', sys.argv[2], '-c'], capture_output=True, text=True).stdout.split()
++host = [int(x, 16) for x in out[:n]]
++for i, (a, h) in enumerate(zip(am, host)):
++    if a != h: print('first difference at tick', i + 1, 'amiga %08x host %08x' % (a, h)); break
++else: print('equal for', min(len(am), len(host)), 'ticks')
+diff --git a/tools/debug_run.sh b/tools/debug_run.sh
+index 1861568..ffe5470 100755
+--- a/tools/debug_run.sh
++++ b/tools/debug_run.sh
+@@ -4,8 +4,8 @@
+ cd "$(dirname "$0")/.."
+ . ./port.conf
+ OUT="$1"; N="$2"; shift 2
+-CFLAGS="$CFLAGS -DLOGIC_TRACE=8192 $*" tools/build.sh dist/llb_dbg $SOURCES src/prof68k.s >/dev/null || exit 1
+-rm -rf "$OUT"; mkdir -p "$OUT/S"; cp dist/llb_dbg "$OUT/"
+-printf 'llb_dbg bench %s\n' "$N" > "$OUT/S/startup-sequence"
+-UAE_DONE="$OUT/bench.txt" tools/run_uae.sh "$OUT" $(( N / 20 + 90 )) "$OUT/shot.png" $UAE_OPTS     # e.g. UAE_OPTS=--fast_memory=4096
++CFLAGS="$CFLAGS -DLOGIC_TRACE=8192 $*" tools/build.sh dist/${NAME}_dbg $SOURCES src/prof68k.s >/dev/null || exit 1
++rm -rf "$OUT"; mkdir -p "$OUT/S"; cp dist/${NAME}_dbg "$OUT/"
++printf '%s_dbg bench %s\n' "$NAME" "$N" > "$OUT/S/startup-sequence"
++UAE_DONE="$OUT/bench.txt" tools/run_uae.sh "$OUT" ${UAE_SECS:-$(( N / 20 + 90 ))} "$OUT/shot.png" $UAE_OPTS     # e.g. UAE_OPTS=--fast_memory=4096
+ cat "$OUT/bench.txt" 2>/dev/null || echo "no bench.txt"
+diff --git a/tools/games/cobra.py b/tools/games/cobra.py
+new file mode 100644
+index 0000000..d358e8c
+--- /dev/null
++++ b/tools/games/cobra.py
+@@ -0,0 +1,76 @@
++"""cobra.py - what the translator needs to know about Cobra Triangle (Rare 1989, PAL, AxROM) that it cannot find
++out by itself. Loaded by tools/recomp.py (--game cobra). See tools/games/llb.py for an MMC1 example and
++PLAYBOOK-NES.md sections 3-5 for how to find each entry.
++"""
++NORETURN = set()        # subroutines that pop their own return address (jump-table dispatchers)
++
++# $FFB0 (the same in all four banks): DEX/BNE, DEY/BNE delay loop, X*Y iterations, used for raster timing.
++# The port has no raster timing: the result is X = 0, Y = 0, Z set, N clear, C and V unchanged.
++_DELAY = '''
++    moveq #0,d1
++    moveq #0,d2
++'''
++HLE = {(b, 0xffb0): _DELAY for b in range(4)}  # (bank, address): hand-written 68k text, exact, proven by the checksum
++HLE_FALLBACK = set()    # entries of HLE whose text may branch to .orig
++
++# $FFA1 / $FFA9 in bank 2 (reached by JSR $FF9C / $FFA4 from bank 0, which switch to bank 2): the boat's CHR RAM
++# upload. Y passes of 16 bytes: byte k of a pass is ROM[table_k + X] (16 tables $100 apart, from $DE00 or
++# $EE00), written to $2007; X+1 between passes; then STY $8000 (Y = 0: back to bank 0) and RTS.
++# By hand: straight into CHR RAM with the same dirty-tile marks as the $2007 path. Ends with A = the last byte,
++# X advanced, Y = 0, N clear, Z set, C and V unchanged. Falls back to the translation unless the writes are
++# +1 apart and stay below $2000 (CHR RAM).
++def _upload(tab):
++    return '''
++    move.w _ppu_v,d3
++    and.w #$3fff,d3
++    btst #2,_ppu_ctrl
++    bne .orig
++    move.l d2,d7
++    and.w #$ff,d7
++    beq .orig
++    lsl.w #4,d7
++    move.w d3,d4
++    add.w d7,d4
++    cmp.w #$2000,d4
++    bhi .orig
++    move.w ccr,-(sp)
++    move.l a2,-(sp)
++    lea _nes_chr_ram,a0
++    adda.w d3,a0
++.it lea $%x(a3),a1
++    adda.l d1,a1
++    moveq #15,d3
++.by move.b (a1),d0
++    lea $100(a1),a1
++    cmp.b (a0),d0
++    beq.s .same
++    move.b d0,(a0)
++    move.l a0,d6
++    sub.l #_nes_chr_ram,d6
++    lsr.w #4,d6
++    lea _chr_dirty_flag,a2
++    tst.b (a2,d6.w)
++    bne.s .same
++    move.b #1,(a2,d6.w)
++    move.w _chr_ndirty,d4
++    add.w d4,d4
++    lea _chr_dirty,a2
++    move.w d6,(a2,d4.w)
++    addq.w #1,_chr_ndirty
++.same addq.l #1,a0
++    dbf d3,.by
++    subq.b #1,d2
++    beq.s .end
++    addq.b #1,d1
++    bra.s .it
++.end add.w d7,_ppu_v
++    move.l (sp)+,a2
++    move.w (sp)+,ccr
++    moveq #0,d2
++    movea.l #$8000,a0
++    bsr _io_wr_d2
++    jmp D_ffaf
++''' % tab
++HLE[(2, 0xffa1)] = _upload(0xde00 - 0x8000)
++HLE[(2, 0xffa9)] = _upload(0xee00 - 0x8000)
++HLE_FALLBACK |= {(2, 0xffa1), (2, 0xffa9)}
+diff --git a/tools/make_assets.sh b/tools/make_assets.sh
+index 78c9f87..ce67987 100755
+--- a/tools/make_assets.sh
++++ b/tools/make_assets.sh
+@@ -15,10 +15,11 @@ import sys
+ d = open(sys.argv[1], 'rb').read()
+ assert d[:4] == b'NES\x1a', 'not an iNES file'
+ mapper = (d[6] >> 4) | (d[7] & 0xf0)
+-assert d[4] == 8 and d[5] == 16 and mapper == 1, ('only 128K PRG + 128K CHR MMC1 games are supported so far '
++ok = (mapper == 1 and d[4] == 8 and d[5] == 16) or (mapper == 7 and d[4] == 8 and d[5] == 0)
++assert ok, ('supported so far: MMC1 with 128K PRG + 128K CHR ROM, AxROM with 128K PRG + CHR RAM '
+     '(this ROM: %d x 16K PRG, %d x 8K CHR, mapper %d): see PLAYBOOK-NES.md section 8' % (d[4], d[5], mapper))
+-open('assets/prg.bin', 'wb').write(d[16:16 + 0x20000])
+-open('assets/chr.bin', 'wb').write(d[16 + 0x20000:16 + 0x40000])
++open('assets/prg.bin', 'wb').write(d[16:16 + d[4] * 0x4000])
++open('assets/chr.bin', 'wb').write(d[16 + d[4] * 0x4000:16 + d[4] * 0x4000 + d[5] * 0x2000])   # empty with CHR RAM
+ PY
+ FLOWS=$(ls tools/flow/*.txt 2>/dev/null | grep -v "_input.txt" || true)    # traces from tools/nesref -c; none is fine to start
+ python3 tools/recomp.py --game "$GAME" "$ROM" src $FLOWS
+diff --git a/tools/nesref/nesref.c b/tools/nesref/nesref.c
+index 33d374b..7711d45 100644
+--- a/tools/nesref/nesref.c
++++ b/tools/nesref/nesref.c
+@@ -1,4 +1,4 @@
+-/* nesref.c - host-only reference NES (6502 + MMC1 + PPU) used to study the original game and to check the
++/* nesref.c - host-only reference NES (6502 + MMC1 or AxROM + PPU, NTSC or PAL timing) used to study the original game and to check the
+  * port against it. It never runs on the Amiga.
+  *
+  *   nesref rom.nes FRAMES [options]
+@@ -8,6 +8,8 @@
+  *     -c cov.txt        write code coverage: "bank pc" of every executed instruction + indirect targets
+  *     -s                print per-frame stats (instructions, ppu writes)
+  *     -t                trace every instruction (huge)
++ *     -P / -N           force PAL / NTSC timing (default: from the NES 2.0 header, else NTSC)
++ *   Banks in -c output: 16 KB bank numbers for MMC1 (fixed bank = last), 32 KB bank numbers for AxROM (mapper 7).
+  */
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -19,6 +21,9 @@ static uint8_t ram[0x800], vram[0x800], pal[32], oam[256], chrram[0x2000];
+ /* MMC1 */
+ static uint8_t m_shift = 0x10, m_ctrl = 0x0c, m_chr0, m_chr1, m_prg;
+ static uint8_t prgram[0x2000];
++/* AxROM (mapper 7): 32 KB PRG bank, one-screen mirroring */
++static int mapper = 1, pal_timing; static uint8_t ax_reg;
++static int BANKSZ = 0x4000;   /* bytes per bank number in the -c output */
+ 
+ /* CPU */
+ static uint8_t A, X, Y, S = 0xfd, P = 0x24; static uint16_t PC;
+@@ -50,6 +55,7 @@ static void flow(char kind, uint16_t from, uint16_t to)
+ 
+ static int prg_bank_for(uint16_t a)
+ {
++    if (mapper == 7) return ax_reg & 7 & (prg_banks / 2 - 1);
+     int mode = (m_ctrl >> 2) & 3, b = m_prg & 0x0f;
+     if (mode < 2) return (a < 0xc000) ? (b & 0xe) : (b | 1);
+     if (mode == 2) return (a < 0xc000) ? 0 : b;
+@@ -67,6 +73,7 @@ static uint8_t *chr_ptr(uint16_t a)
+ static uint16_t nt_addr(uint16_t a)
+ {
+     a &= 0xfff;
++    if (mapper == 7) return ((ax_reg & 0x10) ? 0x400 : 0) | (a & 0x3ff);
+     switch (m_ctrl & 3) {
+     case 0: return a & 0x3ff;
+     case 1: return 0x400 | (a & 0x3ff);
+@@ -106,7 +113,7 @@ static uint8_t rd(uint16_t a)
+     if (a == 0x4017) return 0x40;
+     if (a < 0x6000) return 0;
+     if (a < 0x8000) return prgram[a & 0x1fff];
+-    return prg[prg_bank_for(a) * 0x4000 + (a & 0x3fff)];
++    return prg[prg_bank_for(a) * BANKSZ + (a & (BANKSZ - 1))];
+ }
+ static void wr(uint16_t a, uint8_t d)
+ {
+@@ -121,7 +128,7 @@ static void wr(uint16_t a, uint8_t d)
+         case 4: oam[oamaddr++] = d; break;
+         case 5: if (!w) { t = (t & 0xffe0) | (d >> 3); fx = d & 7; } else t = (t & 0x8c1f) | ((d & 7) << 12) | ((d & 0xf8) << 2); w ^= 1; break;
+         case 6: if (!w) t = (t & 0x00ff) | ((d & 0x3f) << 8); else { t = (t & 0xff00) | d; v = t; } w ^= 1; break;
+-        case 7: ppu_write(v, d); v += (ppuctrl & 4) ? 32 : 1; break;
++        case 7: if (trace) printf("  VRAM %04x <- %02x\n", v & 0x3fff, d); ppu_write(v, d); v += (ppuctrl & 4) ? 32 : 1; break;
+         }
+         return;
+     }
+@@ -129,6 +136,7 @@ static void wr(uint16_t a, uint8_t d)
+     if (a == 0x4016) { strobe = d & 1; if (strobe) padshift = pad; return; }
+     if (a < 0x6000) return;
+     if (a < 0x8000) { prgram[a & 0x1fff] = d; return; }
++    if (mapper == 7) { if (trace) printf("  MAP %04x <- %02x\n", a, d); ax_reg = d; return; }
+     /* MMC1 */
+     if (d & 0x80) { m_shift = 0x10; m_ctrl |= 0x0c; return; }
+     { int done = m_shift & 1; m_shift = (m_shift >> 1) | ((d & 1) << 4);
+@@ -143,7 +151,7 @@ static void cov_mark(uint16_t pc, int kind)
+     long idx;
+     if (!cov) return;
+     if (pc < 0x8000) { idx = 0; if (!(cov[prg_banks * 0x4000 + (pc & 0x7ff)] & 1)) fprintf(covf, "R %04x\n", pc); cov[prg_banks * 0x4000 + (pc & 0x7ff)] |= 1; return; }
+-    idx = bank * 0x4000 + (pc & 0x3fff);
++    idx = bank * BANKSZ + (pc & (BANKSZ - 1));
+     if (!(cov[idx] & kind)) { cov[idx] |= kind; if (kind != 1) fprintf(covf, "%c %d %04x\n", kind == 2 ? 'J' : kind == 4 ? 'S' : 'N', bank, pc); }
+     (void)idx;
+ }
+@@ -181,8 +189,14 @@ static void irq_nmi(uint16_t vec)
+ static void step(void)
+ {
+     uint8_t op, m, lo, hi; uint16_t a = 0, pc0 = PC; int mode;
+-    if (nmi_pending == 1) { nmi_pending = 0; irq_nmi(0xfffa); pc0 = PC; } else if (nmi_pending) nmi_pending--;   /* NMI one instruction after the flag rises */
++    if (nmi_pending == 1) { static int nl = -1; nmi_pending = 0;
++        if (nl < 0) nl = getenv("NMI_LOG") != 0;
++        if (nl) printf("NMI at %02x:%04x S=%02x\n", PC >= 0x8000 ? prg_bank_for(PC) : 0xff, PC, S);    /* NMI_LOG=1: where the NMI interrupts */
++        irq_nmi(0xfffa); pc0 = PC; } else if (nmi_pending) nmi_pending--;   /* NMI one instruction after the flag rises */
+     if (cov) cov_mark(PC, 1);
++    { static int lastbank = -1; int nb = PC >= 0x8000 ? prg_bank_for(PC) : -1;
++      if (nb >= 0 && lastbank >= 0 && nb != lastbank) flow('B', pc0, PC);
++      if (nb >= 0) lastbank = nb; }
+     if (prof) prof[(PC >= 0x8000 ? prg_bank_for(PC) : 15) * 0x10000 + PC]++;
+     op = rd(PC++);
+     if (trace) printf("%02x:%04x %02x A=%02x X=%02x Y=%02x P=%02x S=%02x\n", pc0 >= 0x8000 ? prg_bank_for(pc0) : 0xff, pc0, op, A, X, Y, P, S);
+@@ -339,7 +353,11 @@ static void dump(const char *dir, int f)
+     fclose(o);
+ }
+ 
+-static void run_cycles(long long n) { long long end = cycles + n; while (cycles < end) step(); }
++static void run_cycles(long long n) { static long long end; if (end < cycles - 1000 || end > cycles + 100000) end = cycles; end += n; while (cycles < end) step(); }
++/* cycles per scanline: NTSC 113.67 (85 + 29, 20 vblank lines), PAL 106.56 (80 + 27, 70 vblank lines) */
++#define LINE_A (pal_timing ? 80 : 85)
++#define LINE_B (pal_timing ? 26 : 29)
++#define VBL_CYC (pal_timing ? 7460 : 114 * 20)
+ 
+ typedef struct { int a, b; uint8_t bits; } In;
+ static In ins[4096]; static int nin;
+@@ -357,6 +375,10 @@ int main(int argc, char **argv)
+     f = fopen(argv[1], "rb"); if (!f) return 2; fseek(f, 0, SEEK_END); sz = ftell(f); rewind(f);
+     rom = malloc(sz); if (fread(rom, 1, sz, f) != (size_t)sz) return 2; fclose(f);
+     prg_banks = rom[4]; chr_banks8 = rom[5]; prg = rom + 16; chr = prg + prg_banks * 0x4000;
++    mapper = (rom[6] >> 4) | (rom[7] & 0xf0);
++    if (mapper == 7) BANKSZ = 0x8000;
++    else if (mapper != 1) { fprintf(stderr, "nesref: mapper %d not supported\n", mapper); return 2; }
++    if ((rom[7] & 0x0c) == 0x08 && (rom[12] & 3) == 1) pal_timing = 1;    /* NES 2.0: PAL */
+     frames = atoi(argv[2]);
+     for (i = 3; i < argc; i++) {
+         if (!strcmp(argv[i], "-i")) { FILE *g = fopen(argv[++i], "r"); char l[256]; while (g && fgets(l, sizeof l, g)) { char *p, *tok; In in; if (sscanf(l, "%d %d", &in.a, &in.b) != 2) continue; in.bits = 0; p = l; strtol(p, &p, 10); strtol(p, &p, 10); for (tok = strtok(p, " \t\r\n+"); tok; tok = strtok(0, " \t\r\n+")) in.bits |= btn(tok); ins[nin++] = in; } if (g) fclose(g); }
+@@ -366,6 +388,8 @@ int main(int argc, char **argv)
+         else if (!strcmp(argv[i], "-s")) stats = 1;
+         else if (!strcmp(argv[i], "-p")) { proff = fopen(argv[++i], "w"); prof = calloc(16 * 0x10000, sizeof *prof); }
+         else if (!strcmp(argv[i], "-t")) trace = 1;
++        else if (!strcmp(argv[i], "-P")) pal_timing = 1;
++        else if (!strcmp(argv[i], "-N")) pal_timing = 0;
+     }
+     PC = rd(0xfffc) | (rd(0xfffd) << 8);
+     if (cov) cov_mark(PC, 4);
+@@ -373,30 +397,34 @@ int main(int argc, char **argv)
+         int y; char key[16];
+         pad = 0; for (i = 0; i < nin; i++) if (fr >= ins[i].a && fr <= ins[i].b) pad |= ins[i].bits;
+         frame_instr = frame_ppuw = frame_2002r = 0;
++        { static int tf = -2; if (tf == -2) { char *e = getenv("TRACE_FROM"); tf = e ? atoi(e) : -1; } if (tf >= 0 && fr == tf) trace = 1; }   /* TRACE_FROM=frame */
+         if (trace) printf("---- frame %d\n", fr);
+         /* pre-render line: copy vertical bits */
+         ppustatus &= ~0x60;
+         for (y = 0; y < 240; y++) {
+             scanline = y;
+-            run_cycles(85);
++            run_cycles(LINE_A);
+             if (ppumask & 0x18) { if (y == 0) v = t; render_line(y);
+                 /* increment y */
+                 if ((v & 0x7000) != 0x7000) v += 0x1000; else { int cy; v &= ~0x7000; cy = (v & 0x03e0) >> 5;
+                     if (cy == 29) { cy = 0; v ^= 0x0800; } else if (cy == 31) cy = 0; else cy++; v = (v & ~0x03e0) | (cy << 5); }
+                 v = (v & ~0x041f) | (t & 0x041f); }
+             else memset(fb[y], pal[0], 256);
+-            run_cycles(29);
++            run_cycles(LINE_B);
+         }
+-        scanline = 240; run_cycles(114);
++        scanline = 240; run_cycles(LINE_A + LINE_B);
+         ppustatus |= 0x80; if (ppuctrl & 0x80) nmi_pending = 2;
+-        scanline = 241; run_cycles(114 * 20);
++        scanline = 241; run_cycles(VBL_CYC);
+         ppustatus &= 0x1f;
+-        scanline = -1; run_cycles(114);
+-        if (stats) printf("frame %d instr %ld ppuw %ld r2002 %ld ctrl %02x mask %02x mmc %02x/%02x/%02x/%02x\n", fr, frame_instr, frame_ppuw, frame_2002r, ppuctrl, ppumask, m_ctrl, m_chr0, m_chr1, m_prg);
++        scanline = -1; run_cycles(LINE_A + LINE_B);
++        if (stats) printf("frame %d instr %ld ppuw %ld r2002 %ld ctrl %02x mask %02x mmc %02x/%02x/%02x/%02x\n", fr, frame_instr, frame_ppuw, frame_2002r, ppuctrl, ppumask, mapper == 7 ? ax_reg : m_ctrl, m_chr0, m_chr1, m_prg);
+         snprintf(key, sizeof key, ",%d,", fr);
+         if (strstr(dumps, key)) dump(dir, fr);
+     }
+-    if (covf) { for (i = 0; i < prg_banks * 0x4000; i++) if (cov[i] & 1) fprintf(covf, "E %d %04x\n", i / 0x4000, (i / 0x4000 == prg_banks - 1 ? 0xc000 : 0x8000) + (i & 0x3fff)); fclose(covf); }
++    if (covf) { for (i = 0; i < prg_banks * 0x4000; i++) if (cov[i] & 1) {
++        if (mapper == 7) fprintf(covf, "E %d %04x\n", i / 0x8000, 0x8000 + (i & 0x7fff));
++        else fprintf(covf, "E %d %04x\n", i / 0x4000, (i / 0x4000 == prg_banks - 1 ? 0xc000 : 0x8000) + (i & 0x3fff)); }
++        fclose(covf); }
+     if (proff) { for (i = 0; i < 16 * 0x10000; i++) if (prof[i]) fprintf(proff, "%u %x %04x\n", prof[i], i >> 16, i & 0xffff); fclose(proff); }
+     fprintf(stderr, "instructions %lld\n", instr_total);
+     return 0;
+diff --git a/tools/nesref/verify.c b/tools/nesref/verify.c
+index c3679d1..9e72e8c 100644
+--- a/tools/nesref/verify.c
++++ b/tools/nesref/verify.c
+@@ -9,6 +9,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include "nes.h"
++#include "gen_code.h"                   /* NES_MAPPER */
+ 
+ uint8_t nes_prg_data[0x20000], nes_chr_data[0x20000];
+ void nes_wait(int kind, uint16_t pc) { (void)kind; (void)pc; }
+@@ -19,7 +20,7 @@ static uint8_t A, X, Y, S = 0xfd, P = 0x24; static uint16_t PC, pc0;
+ static struct { int bank; uint16_t br, loop; int kind; } waits[64]; static int nwaits;
+ static int s0at[0x10000];
+ 
+-static int bank_of(uint16_t a) { return a >= 0xc000 ? 7 : nes_bank; }
++static int bank_of(uint16_t a) { return (nes_mapper == 7 || a < 0xc000) ? nes_bank : 7; }
+ static uint8_t rd(uint16_t a)
+ {
+     if (a == 0x2002 && s0at[pc0] && s0at[pc0] - 1 == bank_of(pc0)) return nes_read_s0();
+@@ -107,7 +108,9 @@ static int step(void)
+             for (k = 0; k < nwaits; k++) if (waits[k].br == pc0 && waits[k].bank == bank_of(pc0)) return 1 + waits[k].kind;
+         }
+     } break;
+-    case 0x4c: PC = a; break;
++    case 0x4c: PC = a;
++        for (k = 0; k < nwaits; k++) if (waits[k].br == pc0 && waits[k].bank == bank_of(pc0) && waits[k].kind == 2) return 3;
++        break;
+     case 0x6c: PC = (uint16_t)(rd(a) | (rd((uint16_t)((a & 0xff00) | ((a + 1) & 0xff))) << 8)); break;
+     case 0x20: push((uint8_t)((PC - 1) >> 8)); push((uint8_t)(PC - 1)); PC = a; break;
+     case 0x60: PC = (uint16_t)((pop() | (pop() << 8)) + 1); break;
+@@ -147,35 +150,43 @@ int main(int argc, char **argv)
+ {
+     unsigned n = (unsigned)atoi(argv[1]), t; FILE *log = fopen(argv[2], "wb"), *f; char line[128];
+     int kind = -1;
+-    f = fopen("assets/prg.bin", "rb"); if (!f || fread(nes_prg_data, 1, 0x20000, f) != 0x20000) return 2; fclose(f);
+-    f = fopen("assets/chr.bin", "rb"); if (!f || fread(nes_chr_data, 1, 0x20000, f) != 0x20000) return 2; fclose(f);
++    f = fopen("assets/prg.bin", "rb"); if (!f || fread(nes_prg_data, 1, 0x20000, f) != NES_PRG_SIZE) return 2; fclose(f);
++    f = fopen("assets/chr.bin", "rb"); if (!f || fread(nes_chr_data, 1, 0x20000, f) != NES_CHR_SIZE) return 2; fclose(f);
+     f = fopen("src/gen_waits.txt", "r");
+     while (f && fgets(line, sizeof line, f)) {
+         int b; unsigned br, lp; char k[8];
+         if (sscanf(line, "%d %x %x %7s", &b, &br, &lp, k) != 4) continue;
+         if (!strcmp(k, "S0")) { s0at[br] = b + 1; continue; }
+         waits[nwaits].bank = b; waits[nwaits].br = (uint16_t)br; waits[nwaits].loop = (uint16_t)lp;
+-        waits[nwaits].kind = !strcmp(k, "VBL"); nwaits++;
++        waits[nwaits].kind = !strcmp(k, "VBL") ? 1 : !strcmp(k, "IDLE") ? 2 : 0; nwaits++;
+     }
+     if (f) fclose(f);
+-    nes_init(nes_prg_data, nes_chr_data);
++    nes_init(nes_prg_data, NES_CHR_SIZE ? nes_chr_data : 0, NES_MAPPER);
+     PC = (uint16_t)(nes_rd(0xfffc) | nes_rd(0xfffd) << 8);
+     for (t = 0; t < n; t++) {
+         nes_pad = pad_of(bench_input(t));
+-        if (kind >= 0) {                                /* start of a frame after a wait: NMI, then the vblank flag */
++        if (kind == 2) {                                /* idle (a jump to itself): the NMI runs until the next wait */
++            if (ppu_ctrl & 0x80) {
++                push((uint8_t)(PC >> 8)); push((uint8_t)PC); push((uint8_t)((P & ~0x10) | 0x20)); P |= FI;
++                PC = (uint16_t)(nes_rd(0xfffa) | nes_rd(0xfffb) << 8);
++            }
++        } else if (kind >= 0) {                         /* start of a frame after a wait: NMI, then the vblank flag */
+             if (ppu_ctrl & 0x80) {
+                 uint16_t back = PC; uint8_t s0 = S;
+                 push((uint8_t)(PC >> 8)); push((uint8_t)PC); push((uint8_t)((P & ~0x10) | 0x20)); P |= FI;
+                 PC = (uint16_t)(nes_rd(0xfffa) | nes_rd(0xfffb) << 8);
+                 split_seen = 0;
+                 while (!(PC == back && S == s0)) {
+-                    if (step()) { fprintf(stderr, "verify: wait inside the NMI at tick %u\n", t); return 3; }
++                    int r = step();
++                    if (r == 3) { kind = 2; goto frame_done; }      /* the NMI idles: the main thread is gone */
++                    if (r) { fprintf(stderr, "verify: wait inside the NMI at tick %u\n", t); return 3; }
+                 }
+                 split_on = split_seen;
+             }
+             if (kind == 1) ppu_vbl = 1;
+         }
+         for (;;) { int r = step(); if (r) { kind = r - 1; break; } }
++    frame_done:
+         fwrite(nes_ram, 1, sizeof nes_ram, log);
+     }
+     fclose(log);
+diff --git a/tools/prof.py b/tools/prof.py
+new file mode 100644
+index 0000000..ebafcd8
+--- /dev/null
++++ b/tools/prof.py
+@@ -0,0 +1,52 @@
++#!/usr/bin/env python3
++"""prof.py <debug-run dir> [first_tick last_tick] - name the samples of the 1 kHz profiler (src/prof68k.s).
++
++<dir> is what tools/debug_run.sh wrote: prof.bin (runtime address of the reset function, of game_tick, then one
++program counter per millisecond), frames.bin (vertical blank, tick) and the debug program <NAME>_dbg.
++Translated code is named from the symbols of src/gen68k.s (assembled again here), C code from the linked
++program's symbols relative to _game_tick. With a tick range, only samples taken while those ticks ran count
++(the busiest scene: PLAYBOOK-NES.md section 4)."""
++import sys, struct, subprocess, bisect, collections, os, glob
++d = sys.argv[1]
++lo, hi = (int(sys.argv[2]), int(sys.argv[3])) if len(sys.argv) > 3 else (0, 1 << 30)
++raw = open(os.path.join(d, 'prof.bin'), 'rb').read()
++base, cbase = struct.unpack('>II', raw[:8]); pcs = struct.unpack('>%dI' % ((len(raw) - 8) // 4), raw[8:])
++exe = glob.glob(os.path.join(d, '*_dbg'))[0]
++def nm(args):
++    out = subprocess.run(['docker', 'run', '--rm', '-v', os.getcwd() + ':/work', '-w', '/work', 'amigadev/crosstools:m68k-amigaos',
++                          'bash', '-c', args], capture_output=True, text=True).stdout
++    syms = []
++    for l in out.split('\n'):
++        p = l.split()
++        if len(p) == 3 and p[1] in 'tT': syms.append((int(p[0], 16), p[2]))
++    return sorted(syms)
++gen = nm('vasmm68k_mot -quiet -Fhunk -m68020 -I. -Isrc -o /tmp/g.o src/gen68k.s && m68k-amigaos-nm /tmp/g.o')
++cs = nm('m68k-amigaos-nm ' + exe)
++goff = dict((n, a) for a, n in gen)
++gbase = base - goff.get('F0_' + '%04x' % 0, goff[min(goff, key=lambda k: goff[k])]) if False else None
++ref = [n for a, n in gen if n.startswith('F')]
++# the reset function's runtime address is base; its symbol is the one _reset_fn points at
++rsym = subprocess.run(['grep', '-m1', '_reset_fn:', 'src/gen68k.s'], capture_output=True, text=True).stdout.split()[-1]
++gbase = base - goff[rsym]
++cmap = dict((n, a) for a, n in cs)
++cb = cbase - cmap.get('_game_tick', 0)
++gaddr = [a + gbase for a, n in gen]; gname = [n for a, n in gen]
++caddr = [a + cb for a, n in cs]; cname = [n for a, n in cs]
++# select samples by tick: frames.bin gives (vblank, tick) per drawn frame; samples are 1 ms apart, 20 per vblank
++fr = open(os.path.join(d, 'frames.bin'), 'rb').read(); fr = struct.unpack('>%dI' % (len(fr) // 4), fr)
++pairs = [(fr[i], fr[i + 1]) for i in range(0, len(fr), 2)]
++v0 = pairs[0][0] if pairs else 0
++def tick_at(sample):
++    vb = v0 + sample // 20
++    i = bisect.bisect_right([p[0] for p in pairs], vb) - 1
++    return pairs[i][1] if i >= 0 else 0
++cnt = collections.Counter(); n = 0
++for i, pc in enumerate(pcs):
++    if not (lo <= tick_at(i) < hi): continue
++    n += 1
++    j = bisect.bisect_right(gaddr, pc) - 1
++    if j >= 0 and pc - gaddr[j] < 0x4000 and gname[j] and pc < gaddr[-1] + 0x2000: cnt['gen ' + gname[j]] += 1; continue
++    j = bisect.bisect_right(caddr, pc) - 1
++    cnt['C ' + (cname[j] if j >= 0 else '?')] += 1
++print('samples', n)
++for k, v in cnt.most_common(40): print('%5.1f%% %s' % (100.0 * v / max(n, 1), k))
+diff --git a/tools/recomp.py b/tools/recomp.py
+index 39f12f5..a31557e 100644
+--- a/tools/recomp.py
++++ b/tools/recomp.py
+@@ -37,35 +37,58 @@ sys.argv = [sys.argv[0]] + args
+ rom = open(sys.argv[1], 'rb').read()
+ nprg = rom[4]
+ prg = rom[16:16 + nprg * 16384]
+-FIXED = nprg - 1
++MAPPER = (rom[6] >> 4) | (rom[7] & 0xf0)
+ outdir = sys.argv[2]
++# Bank models. MMC1 (mapper 1): 16 KB banks, bank number = 16 KB bank, the last one fixed at $C000.
++# AxROM (mapper 7): 32 KB banks switched as a whole, bank number = 32 KB bank, nothing fixed (FIXED = -1).
++# In AxROM a write to $8000-$FFFF switches the bank under the running code: the translated function ends
++# there and the code after it is dispatched in whatever bank is then mapped (see successors(), mapper_write()).
++AX = MAPPER == 7
++if AX:
++    NBANKS = nprg // 2
++    FIXED = -1
++else:
++    NBANKS = nprg
++    FIXED = nprg - 1
+ 
+ def rd(ctx, a):
+     a &= 0xffff
++    if AX:
++        if a >= 0x8000: return prg[ctx * 0x8000 + a - 0x8000]
++        return 0x02
+     if a >= 0xc000: return prg[FIXED * 0x4000 + a - 0xc000]
+     if a >= 0x8000: return prg[ctx * 0x4000 + a - 0x8000]
+     return 0x02                 # not ROM: decodes as an unknown opcode
+ 
+ def ctx_of(ctx, a):
+     """bank a code address belongs to, seen from code running with switchable bank ctx (7 = unknown)"""
++    if AX: return ctx
+     return FIXED if a >= 0xc000 else ctx
+ 
++def vec_banks():
++    """(bank, vector table base) pairs to read the reset/NMI/IRQ vectors from"""
++    return [(b, b * 0x8000 + 0x7ffa) for b in range(NBANKS)] if AX else [(FIXED, FIXED * 0x4000 + 0x3ffa)]
++
+ # ---------------------------------------------------------------- inputs
+ executed = set(); entries = set(); dyn = collections.defaultdict(set)
+-reset = prg[FIXED * 0x4000 + 0x3ffc] | prg[FIXED * 0x4000 + 0x3ffd] << 8
+-nmi = prg[FIXED * 0x4000 + 0x3ffa] | prg[FIXED * 0x4000 + 0x3ffb] << 8
+-irq = prg[FIXED * 0x4000 + 0x3ffe] | prg[FIXED * 0x4000 + 0x3fff] << 8
+-entries |= {(FIXED, reset), (FIXED, nmi), (FIXED, irq)}
++vectors = set()                 # (bank, address) of every reset/NMI/IRQ entry
++for vb, base in vec_banks():
++    for k in (0, 2, 4): vectors.add((vb, prg[base + k] | prg[base + k + 1] << 8))
++RESET_BANK = 0 if AX else FIXED                 # AxROM boots in bank 0 (the reference and the port agree)
++reset = prg[vec_banks()[0][1] + 2] | prg[vec_banks()[0][1] + 3] << 8
++nmi = prg[vec_banks()[0][1]] | prg[vec_banks()[0][1] + 1] << 8
++irq = prg[vec_banks()[0][1] + 4] | prg[vec_banks()[0][1] + 5] << 8
++entries |= vectors
+ for fn in sys.argv[3:]:
+     for line in open(fn):
+         p = line.split()
+         if not p: continue
+         if p[0] == 'E': executed.add((int(p[1]), int(p[2], 16)))
+-        elif p[0] in 'IUX':
++        elif p[0] in 'IUXB':
+             b, to = int(p[1]), int(p[2], 16)
+             if to < 0x8000: continue
+-            entries.add((FIXED if to >= 0xc000 else b, to))
+-            dyn['all'].add((FIXED if to >= 0xc000 else b, to))
++            entries.add((ctx_of(b, to), to))
++            dyn['all'].add((ctx_of(b, to), to))
+             if p[0] == 'I': dyn['I'].add((b, to))
+ 
+ # ---------------------------------------------------------------- decoding
+@@ -91,12 +114,21 @@ def static_branch(ctx, a, prev):
+     if pm == 'CLV' and m in ('BVC', 'BVS'): return m == 'BVC'
+     return None
+ 
++def mapper_write(d):
++    """AxROM: does this instruction write the bank register? (a store to $8000-$FFFF)"""
++    if not AX or not d: return False
++    m, mode, arg, n = d
++    if m not in ('STA', 'STX', 'STY', 'INC', 'DEC', 'ASL', 'LSR', 'ROL', 'ROR'): return False
++    if mode in ('abs', 'abx', 'aby') and arg >= 0x8000 - (255 if mode != 'abs' else 0): return True
++    return False
++
+ def successors(ctx, a, prev):
+     """(fallthrough?, list of local jump targets, call target or None)"""
+     d = insn(ctx, a)
+     if not d: return False, [], None
+     m, mode, arg, n = d
+     if m in ('RTS', 'RTI', 'BRK'): return False, [], None
++    if mapper_write(d): return False, [], None          # the code after it runs in the bank just mapped
+     if m == 'JMP': return False, ([arg] if mode == 'abs' else []), None
+     if m == 'JSR': return (arg not in NORETURN), [], arg
+     if mode == 'rel':
+@@ -123,15 +155,30 @@ def body(ctx, entry, stop_at_entries):
+             work.append((t, d))
+     return sorted(seen)
+ 
++def same_code(b1, b2, a, n=24):
++    return all(rd(b1, a + i) == rd(b2, a + i) for i in range(n))
++
+ # fixpoint over JSR targets
+ while True:
+     new = set()
+     for (ctx, e) in list(entries):
++        prevd = None
+         for a in body(ctx, e, False):
+             d = insn(ctx, a)
++            if mapper_write(d):
++                # the continuation: in the bank the stored value names (LDA/LDX/LDY #imm just before), and in
++                # every bank that has the same code there (common code). The traces add the others ('B' lines).
++                nx = (a + d[3]) & 0xffff
++                reg = {'STA': 'LDA', 'STX': 'LDX', 'STY': 'LDY'}.get(d[0])
++                if prevd and prevd[0] == reg and prevd[1] == 'imm': new.add(((prevd[2] & 7) % NBANKS, nx))
++                for b in range(NBANKS):
++                    if same_code(ctx, b, nx): new.add((b, nx))
++            prevd = d
+             if d and d[0] == 'JSR':
+                 t = d[2]
+-                if t >= 0xc000: new.add((FIXED, t))
++                if AX:
++                    if t >= 0x8000: new.add((ctx, t))
++                elif t >= 0xc000: new.add((FIXED, t))
+                 elif t >= 0x8000 and (ctx != FIXED and a < 0xc000): new.add((ctx, t))
+                 elif t >= 0x8000 and ctx != FIXED: new.add((ctx, t))
+             if d and d[0] == 'JSR' and d[2] in NORETURN:      # the words after it are jump targets
+@@ -139,7 +186,7 @@ while True:
+                 for k in range(64):
+                     w = rd(ctx, tb + 2 * k) | rd(ctx, tb + 2 * k + 1) << 8
+                     if w < 0x8000 or (ctx == FIXED and w < 0xc000 and (ctx, w) not in entries): break
+-                    if (ctx_of(ctx, w), w) in executed or (FIXED if w >= 0xc000 else ctx, w) in dyn['I']:
++                    if (ctx_of(ctx, w), w) in executed or (ctx_of(ctx, w), w) in dyn['I']:
+                         new.add((ctx_of(ctx, w), w)); dyn['all'].add((ctx_of(ctx, w), w))
+     new -= entries
+     if not new: break
+@@ -153,6 +200,10 @@ _UD = {'LDA': ('', 'a'), 'LDX': ('', 'x'), 'LDY': ('', 'y'), 'BIT': ('', ''), 'A
+        'ASL': ('a', 'a'), 'LSR': ('a', 'a'), 'NOP': ('', '')}
+ 
+ def wait_kind(ctx, start, br):
++    if start == br: return 'IDLE'           # a branch to itself: nothing but an interrupt ends it
++    return wait_kind2(ctx, start, br)
++
++def wait_kind2(ctx, start, br):
+     """the loop start..br (br = the branch back) can only end when an interrupt changes memory:
+     it writes nothing, reads fixed addresses only, and sets every register before using it.
+     RAM poll -> 'RAM', $2002 with a bit 7 test -> 'VBL', with a bit 6 test -> 'S0'"""
+@@ -171,15 +222,48 @@ def wait_kind(ctx, start, br):
+         a += n
+     if not reads or (a - start) > 16: return None
+     if 0x2002 in reads:
+-        return 'S0' if bits & {'BVC', 'BVS'} else 'VBL'
++        if bits & {'BVC', 'BVS'}: return 'S0'
++        # BIT $2002 with BEQ/BNE tests A & $2002: A set by LDA #imm just before the loop says which bit
++        if bits & {'BEQ', 'BNE'} and rd(ctx, start - 2) == 0xa9 and rd(ctx, start - 1) & 0x40 and not rd(ctx, start - 1) & 0x80:
++            return 'S0'
++        return 'VBL'
+     if all(r < 0x2000 for r in reads): return 'RAM'
+     return None
+ 
++# ---------------------------------------------------------------- AxROM: which functions may return in another bank
++# A function may leave another bank mapped when it writes the bank register (it ends there and the rest runs
++# dispatched), or calls or jumps to one that may. After a JSR to such a function the caller checks the bank.
++may_switch = set()
++if AX:
++    changed = True
++    while changed:
++        changed = False
++        for (ctx, e) in entries:
++            if (ctx, e) in may_switch: continue
++            hit = False
++            bset = set(body(ctx, e, True))
++            for a in sorted(bset):
++                d = insn(ctx, a)
++                if not d: continue
++                if mapper_write(d) or (d[0] == 'JMP' and d[1] == 'ind'): hit = True; break
++                t = None
++                if d[0] == 'JSR' or (d[0] == 'JMP' and d[1] == 'abs') or d[1] == 'rel': t = d[2]
++                if t is None or (t in bset and d[0] != 'JSR'): continue
++                if t < 0x8000 or (ctx, t) not in entries or (ctx, t) in may_switch: hit = True; break
++            if hit: may_switch.add((ctx, e)); changed = True
++
++def bank_check(ctx, t):
++    """AxROM: after a JSR to t from bank ctx, must the caller check that its bank is still mapped?"""
++    return AX and (t < 0x8000 or (ctx, t) in may_switch or (ctx, t) not in entries)
++
+ # ---------------------------------------------------------------- C generation
+ def fname(ctx, a): return 'F%d_%04x' % (ctx_of(ctx, a), a)
+ 
+ def call_expr(ctx, at, t):
+     """C expression that runs the subroutine at t, called from code at address 'at' in a function of bank ctx"""
++    if AX:
++        if t >= 0x8000 and (ctx, t) in entries: return fname(ctx, t) + '()'
++        return 'nes_dispatch(0x%04x)' % t
+     if t >= 0xc000: return fname(FIXED, t) + '()'
+     if t < 0x8000: return 'nes_dispatch(0x%04x)' % t
+     if ctx == FIXED: return 'nes_dispatch(0x%04x)' % t
+@@ -198,7 +282,8 @@ def operand(ctx, m, mode, arg, s0):
+         return '', e, e + ' = {v};'
+     if mode == 'abs':
+         if arg < 0x2000: return '', 'M[0x%03x]' % (arg & 0x7ff), 'M[0x%03x] = {v};' % (arg & 0x7ff)
+-        if arg >= 0xc000: rde = 'P[0x%05x]' % (FIXED * 0x4000 + arg - 0xc000)
++        if AX and arg >= 0x8000: rde = 'P[0x%05x]' % (ctx * 0x8000 + arg - 0x8000)
++        elif arg >= 0xc000: rde = 'P[0x%05x]' % (FIXED * 0x4000 + arg - 0xc000)
+         elif arg >= 0x8000: rde = 'nes_prg_lo[0x%04x]' % (arg - 0x8000)
+         elif arg == 0x2002 and s0: rde = 'nes_read_s0()'
+         else: rde = 'nes_io_read(0x%04x)' % arg
+@@ -207,6 +292,8 @@ def operand(ctx, m, mode, arg, s0):
+         r = mode[-1]
+         if arg + 255 < 0x800: e = 'M[0x%03x + %s]' % (arg, r); return '', e, e + ' = {v};'
+         if arg + 255 < 0x2000: e = 'M[(0x%04x + %s) & 0x7ff]' % (arg, r); return '', e, e + ' = {v};'
++        if AX and arg >= 0x8000 and arg + 255 <= 0xffff:
++            return 'ea = 0x%04x + %s;' % (arg, r), 'P[0x%05x + %s]' % (ctx * 0x8000 + arg - 0x8000, r), 'nes_write_slow(ea, {v});'
+         if arg >= 0xc000 and arg + 255 <= 0xffff:
+             return 'ea = 0x%04x + %s;' % (arg, r), 'P[0x%05x + %s]' % (FIXED * 0x4000 + arg - 0xc000, r), 'nes_write_slow(ea, {v});'
+         if arg >= 0x8000 and arg + 255 < 0xc000:
+@@ -244,6 +331,8 @@ def gen_function(ctx, entry):
+                     if d[2] <= x <= a: s0_loops.add(x); s0_found.add((ctx_of(ctx, x), x))
+             elif k:
+                 waits[a] = (k, d[2]); waits_found.append((ctx_of(ctx, a), a, d[2], k))
++        if d and d[0] == 'JMP' and d[1] == 'abs' and d[2] == a:             # JMP to itself: idle until the NMI
++            waits[a] = ('IDLE', a); waits_found.append((ctx_of(ctx, a), a, a, 'IDLE'))
+     # also the exit-branch form of the sprite 0 wait: BIT $2002 / BMI out / BVC back
+     body_lines = []
+     prev = None
+@@ -311,7 +400,9 @@ def gen_function(ctx, entry):
+         elif mode == 'rel':
+             sb = static_branch(ctx, a, prev)
+             cond = BR[m]
+-            if a in waits:
++            if a in waits and waits[a][0] == 'IDLE':
++                L.append('if (%s) { SAVE; nes_idle(0x%04x); return 0; }' % (cond, a))
++            elif a in waits:
+                 kind, lp = waits[a]
+                 labels.add(lp)
+                 L.append('if (%s) { SAVE; nes_wait(%s, 0x%04x); LOAD; goto L_%04x; }' % (cond, 'WAIT_' + kind, lp, lp))
+@@ -322,7 +413,8 @@ def gen_function(ctx, entry):
+                 if arg in aset: labels.add(arg); L.append('if (%s) goto L_%04x;' % (cond, arg))
+                 else: L.append('if (%s) { SAVE; return %s; }' % (cond, call_expr(ctx, a, arg)))
+         elif m == 'JMP':
+-            if mode == 'abs':
++            if a in waits: L.append('SAVE; nes_idle(0x%04x); return 0;' % a)
++            elif mode == 'abs':
+                 if arg in aset: labels.add(arg); L.append('goto L_%04x;' % arg)
+                 else: L.append('SAVE; return %s;' % call_expr(ctx, a, arg))
+             else:
+@@ -337,6 +429,7 @@ def gen_function(ctx, entry):
+                 L.append('SAVE; return %s;' % call_expr(ctx, a, arg))
+             else:
+                 L.append('SAVE; r = %s; if (r != 0x%04x) return r; LOAD;' % (call_expr(ctx, a, arg), (ret + 1) & 0xffff))
++                if bank_check(ctx, arg): L.append('if (nes_bank != %d) return nes_dispatch(0x%04x);' % (ctx, (ret + 1) & 0xffff))
+         elif m == 'RTS':
+             L.append('s++; t = M[0x100 + s]; s++; t |= M[0x100 + s] << 8; SAVE; return (uint16_t)(t + 1);')
+         elif m == 'RTI':
+@@ -346,6 +439,7 @@ def gen_function(ctx, entry):
+             L.append('SAVE; nes_fatal(0x%04x, 2); return 0;' % a)
+         else:
+             raise ValueError(m)
++        if mapper_write(d): L.append('SAVE; return nes_dispatch(0x%04x);' % fall)    # continue in the new bank
+         # fallthrough into an instruction that is not emitted next
+         ft, _, _ = successors(ctx, a, prev)
+         if m in ('JSR',) and arg in NORETURN: ft = False
+@@ -387,17 +481,21 @@ for ctx in range(nprg):                 # every bank gets a file, even without c
+         if not byctx.get(ctx): f.write('typedef int gen_bank%d_is_empty;\n' % ctx)
+     decls += ['uint16_t %s(void);' % fname(ctx, e) for e in byctx.get(ctx, [])]
+ with open(os.path.join(outdir, 'gen_code.h'), 'w') as f:
+-    f.write('/* generated by tools/recomp.py: do not edit */\n' + '\n'.join(decls) + '\n#define NES_NMI_FN %s\n#define NES_RESET_FN %s\n' % (fname(FIXED, nmi), fname(FIXED, reset)))
++    f.write('/* generated by tools/recomp.py: do not edit */\n' + '\n'.join(decls) + '\n#define NES_RESET_FN %s\n' % fname(RESET_BANK, reset))
++    f.write('#define NES_MAPPER %d\n#define NES_PRG_SIZE 0x%x\n#define NES_CHR_SIZE 0x%x\n' % (MAPPER, nprg * 0x4000, rom[5] * 0x2000))
+ with open(os.path.join(outdir, 'gen_dispatch.c'), 'w') as f:
+-    f.write(HDR + '#include "gen_code.h"\n\nuint16_t nes_dispatch(uint16_t pc)\n{\n    if (pc >= 0xc000) switch (pc) {\n')
+-    for e in byctx[FIXED]: f.write('    case 0x%04x: return %s();\n' % (e, fname(FIXED, e)))
++    f.write(HDR + '#include "gen_code.h"\n\nuint16_t nes_dispatch(uint16_t pc)\n{\n')
++    if AX: f.write('    if (0) {\n')
++    else:
++        f.write('    if (pc >= 0xc000) switch (pc) {\n')
++        for e in byctx[FIXED]: f.write('    case 0x%04x: return %s();\n' % (e, fname(FIXED, e)))
+     f.write('    } else if (pc >= 0x8000) switch (nes_bank) {\n')
+     for ctx in sorted(byctx):
+         if ctx == FIXED: continue
+         f.write('    case %d: switch (pc) {\n' % ctx)
+         for e in byctx[ctx]: f.write('        case 0x%04x: return %s();\n' % (e, fname(ctx, e)))
+         f.write('        } break;\n')
+-    f.write('    }\n    nes_fatal(pc, 3);\n    return 0;\n}\n\nuint16_t nes_reset_entry(void) { return %s(); }\n' % fname(FIXED, reset))
++    f.write('    }\n    nes_fatal(pc, 3);\n    return 0;\n}\n\nuint16_t nes_reset_entry(void) { return %s(); }\n' % fname(RESET_BANK, reset))
+ with open(os.path.join(outdir, 'gen_waits.txt'), 'w') as f:
+     for w in sorted(set(waits_found)): f.write('%d %04x %04x %s\n' % w)
+     for b, x in sorted(s0_found): f.write('%d %04x 0000 S0\n' % (b, x))
+@@ -413,5 +511,5 @@ if miss: print('not decoded, first:', ' '.join('%d:%04x' % x for x in miss[:20])
+ 
+ # ---------------------------------------------------------------- the 68k assembly back end
+ import back68k
+-dynamic_entries = dyn['all'] | {(FIXED, reset), (FIXED, nmi), (FIXED, irq)}
++dynamic_entries = dyn['all'] | vectors | {(c, e) for (c, e) in entries if AX}   # AxROM: anything may be dispatched
+ back68k.generate(globals())
+diff --git a/tools/shot_at.sh b/tools/shot_at.sh
+index ca9bfe8..ab9de94 100755
+--- a/tools/shot_at.sh
++++ b/tools/shot_at.sh
+@@ -4,9 +4,9 @@
+ cd "$(dirname "$0")/.."
+ . ./port.conf
+ T="$1"; OUT="$2"; AT="${3:-$(( 14 + T * 3 / 100 ))}"
+-CFLAGS="$CFLAGS -DHOLD_AT=$T" tools/build.sh dist/llb_hold $SOURCES >/dev/null || exit 1
+-D=$(mktemp -d /tmp/hold.XXXXXX); mkdir -p "$D/S"; cp dist/llb_hold "$D/"
+-printf 'llb_hold bench %s\n' $(( T + 10 )) > "$D/S/startup-sequence"
++CFLAGS="$CFLAGS -DHOLD_AT=$T" tools/build.sh dist/${NAME}_hold $SOURCES >/dev/null || exit 1
++D=$(mktemp -d /tmp/hold.XXXXXX); mkdir -p "$D/S"; cp dist/${NAME}_hold "$D/"
++printf '%s_hold bench %s\n' "$NAME" $(( T + 10 )) > "$D/S/startup-sequence"
+ case "$OUT" in /*) ;; *) OUT="$PWD/$OUT" ;; esac
+ UAE_SHOT_AT="$AT" UAE_STOP_AFTER_SHOT=1 tools/run_uae.sh "$D" $(( AT + 5 )) "$OUT"
+ rm -rf "$D"
+diff --git a/tools/vhost.c b/tools/vhost.c
+index dde933a..168a5cb 100644
+--- a/tools/vhost.c
++++ b/tools/vhost.c
+@@ -1,7 +1,7 @@
+ /* vhost.c - host only: runs the game logic and src/video.c with a fake kit display, and writes what the
+  * Amiga would show (playfield + hardware sprites) as PPM pictures. For finding display bugs without the emulator.
+  *   cc -Itools/hostinc -Ikit -Isrc tools/vhost.c src/video.c src/logic.c src/nes.c src/run_c.c src/coro_host.c src/gen_*.c
+- *   vhost N t1,t2,...   (frames: one display frame per tick, 60 a second)
++ *   vhost N t1,t2,...   (frames: one display frame per tick)
+  */
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -41,24 +41,36 @@ static void shot(const char *name)
+         for (p = 0; p < 4; p++) c |= ((disp_front[off + p * disp_plane] >> b) & 1) << p;
+         img[y][x] = pal[c];
+     }
+-    for (n = 0; n < 7; n += 1) {            /* walk each sprite list: segments of (pos, ctl, lines) */
+-        UBYTE *d = (UBYTE *)spr[n], *o; int odd = n & 1;
+-        if (!d || (n < 6 && odd)) continue;
+-        o = (n < 6 && spr[n + 1]) ? (UBYTE *)spr[n + 1] : 0;
++    for (n = 6; n >= 0; n--) {              /* walk each sprite list: segments of (pos, ctl, lines); lower numbers on top */
++        UBYTE *d = (UBYTE *)spr[n];
++        if (!d) continue;
+         for (;;) {
++            UWORD pos, ctl; int vs, ve, hs, l; UBYTE *o = 0;
+             if (d - (UBYTE *)spr[n] > 4600) { fprintf(stderr, "sprite %d list runs past its block\n", n); break; }
+-            UWORD pos = (UWORD)(d[0] << 8 | d[1]), ctl = (UWORD)(d[8] << 8 | d[9]);
+-            int vs = pos >> 8, ve = ctl >> 8, hs = ((pos & 0xff) << 1) | (ctl & 1), l;
++            pos = (UWORD)(d[0] << 8 | d[1]); ctl = (UWORD)(d[8] << 8 | d[9]);
++            vs = pos >> 8; ve = ctl >> 8; hs = ((pos & 0xff) << 1) | (ctl & 1);
+             if (!pos && !ctl) break;
+             vs |= (ctl & 4) << 6; ve |= (ctl & 2) << 7;
+             if (ve <= vs) { fprintf(stderr, "sprite %d: bad segment vs %d ve %d\n", n, vs, ve); break; }
++            if ((n & 1) && (ctl & 0x80)) { d += 16 + (ve - vs) * 16; continue; }    /* drawn with its even sprite */
++            if (!(n & 1) && spr[n + 1]) {           /* an attached odd segment at the same place? */
++                UBYTE *q = (UBYTE *)spr[n + 1];
++                for (;;) {
++                    UWORD p2 = (UWORD)(q[0] << 8 | q[1]), c2 = (UWORD)(q[8] << 8 | q[9]); int v2 = p2 >> 8, e2 = c2 >> 8;
++                    if (!p2 && !c2) break;
++                    v2 |= (c2 & 4) << 6; e2 |= (c2 & 2) << 7;
++                    if (e2 <= v2 || q - (UBYTE *)spr[n + 1] > 4600) break;
++                    if (p2 == pos && (c2 & 0x80)) { o = q; break; }
++                    q += 16 + (e2 - v2) * 16;
++                }
++            }
+             for (l = 0; l < ve - vs; l++) for (x = 0; x < 64; x++) {
+                 UBYTE *line = d + 16 + l * 16, *ol = o ? o + 16 + l * 16 : 0; int bx = x >> 3, bt = 7 - (x & 7), v, X = hs - 0x80 + x, Y = vs - 0x34 + l;
+                 v = ((line[bx] >> bt) & 1) | (((line[8 + bx] >> bt) & 1) << 1);
+-                if (ol) v |= (((ol[bx] >> bt) & 1) << 2) | (((ol[8 + bx] >> bt) & 1) << 3); else if (v) v |= 12;
++                if (ol) v |= (((ol[bx] >> bt) & 1) << 2) | (((ol[8 + bx] >> bt) & 1) << 3); else if (v) v |= (n >> 1) << 2;
+                 if (v && X >= 0 && X < 320 && Y >= 0 && Y < 240) img[Y][X] = pal[16 + v];
+             }
+-            d += 16 + (ve - vs) * 16; if (o) o += 16 + (ve - vs) * 16;
++            d += 16 + (ve - vs) * 16;
+         }
+     }
+     f = fopen(name, "wb"); fprintf(f, "P6\n320 240\n255\n");
+@@ -72,8 +84,8 @@ int main(int argc, char **argv)
+ {
+     unsigned n = atoi(argv[1]), t; char key[32], list[4096], name[64]; FILE *g;
+     snprintf(list, sizeof list, ",%s,", argc > 2 ? argv[2] : "");
+-    g = fopen("assets/prg.bin", "rb"); if (!g || fread(nes_prg_data, 1, 0x20000, g) != 0x20000) return 2; fclose(g);
+-    g = fopen("assets/chr.bin", "rb"); if (!g || fread(nes_chr_data, 1, 0x20000, g) != 0x20000) return 2; fclose(g);
++    g = fopen("assets/prg.bin", "rb"); if (!g || !fread(nes_prg_data, 1, 0x20000, g)) return 2; fclose(g);
++    g = fopen("assets/chr.bin", "rb"); if (!g) return 2; if (fread(nes_chr_data, 1, 0x20000, g)) {} fclose(g);   /* empty: CHR RAM */
+     game_init(); video_load(); disp_open(&video_display); video_start();
+     for (t = 0; t < n; t++) {
+         game_tick(game_bench_input(t));
+-- 
+2.43.0
+
