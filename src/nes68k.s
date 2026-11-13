@@ -239,6 +239,7 @@ _io_wr_d2:
         movem.l d0-d1/a0-a1,-(sp)
         moveq   #0,d4
         move.b  d2,d4
+        bra     _io_wr                  ; (the previous port fell into _set_prg here: STY to I/O never ran)
 _set_prg:                               ; d4 = new MMC1 PRG register: as five serial writes would leave it
         move.w  ccr,-(sp)
         move.b  _mmc_ctrl,d3

@@ -599,7 +599,8 @@ void video_frame(void)
         chr_dirty_flag[tl] = 0;
         if ((tl >> 8) == bgsel) {
             bar_dirty = 1;
-            if (col_lo <= col_hi) redraw_tile((UBYTE)tl);
+            if (chr_ndirty > 12) { if (col_lo <= col_hi) invalidate(); }   /* a new tile set: draw everything again */
+            else if (col_lo <= col_hi) redraw_tile((UBYTE)tl);
         }
         if ((tl >> 8) == ((ppu_ctrl >> 3) & 1)) spr_chr_dirty = 1;
     }
